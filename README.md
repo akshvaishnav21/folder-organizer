@@ -1,4 +1,4 @@
-# File Organizer
+# Folder Organizer
 
 A modern Windows desktop application that automatically organizes files by type and/or date into a clean folder hierarchy.
 
@@ -33,7 +33,7 @@ A modern Windows desktop application that automatically organizes files by type 
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  File Organizer                                         │
+│  Folder Organizer                                         │
 │  Automatically organize your files by type and date     │
 │                                                         │
 │  Select Folder                                          │

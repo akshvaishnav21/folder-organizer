@@ -19,8 +19,8 @@ from enum import Enum
 BACKUP_DIR = Path(__file__).parent / "backups"
 
 # Application info
-APP_NAME = "File Organizer"
-APP_VERSION = "1.0.0"
+APP_NAME = "Folder Organizer"
+APP_VERSION = "1.1.0"
 
 
 class SortMode(Enum):
@@ -392,8 +392,8 @@ class ModernStyle:
     BG_LIGHT = "#475569"      # Light slate
 
     TEXT_PRIMARY = "#f8fafc"  # Almost white
-    TEXT_SECONDARY = "#94a3b8" # Gray
-    TEXT_MUTED = "#64748b"    # Muted gray
+    TEXT_SECONDARY = "#cbd5e1" # Light gray (more readable)
+    TEXT_MUTED = "#94a3b8"    # Muted gray (lighter than before)
 
     CARD_BG = "#1e293b"
     BORDER = "#475569"
@@ -443,7 +443,7 @@ class ModernStyle:
 
         style.configure("Status.TLabel",
                        background=cls.BG_DARK,
-                       foreground=cls.TEXT_SECONDARY,
+                       foreground=cls.TEXT_PRIMARY,
                        font=("Segoe UI", 9))
 
         # Button styles
@@ -679,7 +679,7 @@ class FileOrganizerApp:
                 text=f"  {desc}",
                 font=("Segoe UI", 9),
                 bg=ModernStyle.BG_MEDIUM,
-                fg=ModernStyle.TEXT_MUTED
+                fg=ModernStyle.TEXT_SECONDARY
             )
             desc_label.grid(row=0, column=1, sticky="w")
 

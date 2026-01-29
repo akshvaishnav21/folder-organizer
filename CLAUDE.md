@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-File Organizer is a Windows desktop application (Python/tkinter) that organizes files into a hierarchical folder structure based on type and/or date.
+Folder Organizer is a Windows desktop application (Python/tkinter) that organizes files into a hierarchical folder structure based on type and/or date.
 
 ## Running the Application
 
