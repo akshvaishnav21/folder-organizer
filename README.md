@@ -31,6 +31,8 @@ A modern Windows desktop application that automatically organizes files by type 
 ### Options
 - Include/exclude hidden files
 - Include/exclude shortcuts and symlinks
+- **Preserve folders** — Move entire folders as units (By Date mode only)
+- **Flatten all files** — Ignore folder structure and sort all files individually
 - Delete empty folders after organizing
 
 ### Safety Features
@@ -61,6 +63,7 @@ A modern Windows desktop application that automatically organizes files by type 
 │  Options                                                   │
 │  ┌────────────────────────────────────────────────────┐   │
 │  │ ☐ Include hidden files    ☐ Include shortcuts      │   │
+│  │ ☐ Preserve folders        ☐ Flatten all files      │   │
 │  │ ☐ Delete empty folders after organizing            │   │
 │  └────────────────────────────────────────────────────┘   │
 │                                                            │
@@ -93,7 +96,7 @@ python file_organizer.py
 
 1. **Select a folder** — Click "Browse..." to choose the folder to organize
 2. **Choose organization mode** — Select how you want files sorted
-3. **Configure options** — Include hidden files, symlinks, or enable empty folder cleanup
+3. **Configure options** — Include hidden files, symlinks, folder handling, or enable empty folder cleanup
 4. **Preview changes** — Click "Preview Changes" to see what will happen
 5. **Organize** — Click "Organize Files" to execute (backup is automatic)
 6. **Restore if needed** — Click "Restore..." to undo any organization
@@ -112,6 +115,36 @@ python file_organizer.py
 | Fonts        | ttf, otf, woff, woff2, eot                             |
 | No Extension | Files without any extension                             |
 | Other        | Everything else                                         |
+
+## Folder Handling
+
+When your source folder contains subfolders, you have three options:
+
+| Option | Behavior |
+|--------|----------|
+| **Default** | Only root-level files are sorted; subfolders are left untouched |
+| **Preserve folders** | Move entire folders as units into date-based hierarchy (By Date mode only) |
+| **Flatten all files** | Ignore folder structure and sort all files from all subfolders |
+
+**Examples:**
+
+With **Preserve folders** enabled (By Date mode):
+```
+Downloads/
+  ProjectA/          →    2024/01-January/ProjectA/
+    file1.txt
+    file2.doc
+```
+
+With **Flatten all files** enabled:
+```
+Downloads/
+  ProjectA/
+    photo.jpg        →    Images/2024/01-January/photo.jpg
+    report.pdf       →    Documents/2024/02-February/report.pdf
+```
+
+> **Note:** Preserve folders only works with "By Date" mode since folders cannot be categorized by file type.
 
 ## Skip Reasons
 
