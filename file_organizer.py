@@ -9,21 +9,32 @@ import json
 import shutil
 import stat
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from enum import Enum
 import ctypes
-import threading
+
+try:
+    import ttkbootstrap as ttk
+    from ttkbootstrap.constants import *
+    try:
+        from ttkbootstrap.widgets.scrolled import ScrolledFrame
+    except ImportError:
+        from ttkbootstrap.scrolled import ScrolledFrame
+    TTKBOOTSTRAP_AVAILABLE = True
+except ImportError:
+    from tkinter import ttk
+    TTKBOOTSTRAP_AVAILABLE = False
 
 # Directory where backup files are stored (same as script location)
 BACKUP_DIR = Path(__file__).parent / "backups"
 
 # Application info
 APP_NAME = "Folder Organizer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.1.0"
 
 # Windows path length limit
 MAX_PATH_LENGTH = 260
@@ -34,12 +45,21 @@ SYSTEM_FOLDERS = {
     "system32", "syswow64", "$recycle.bin", "recovery", "boot"
 }
 
+# Unicode icons
+ICON_FOLDER = "\U0001F4C1"
+ICON_CALENDAR = "\U0001F4C5"
+ICON_CHECK = "\u2713"
+ICON_WARNING = "\u26A0"
+ICON_ERROR = "\u2717"
+ICON_ARROW = "\u2192"
+ICON_FILE = "\U0001F4C4"
+
 
 class SortMode(Enum):
     """File organization modes."""
-    BY_TYPE = "type"           # Category only
-    BY_DATE = "date"           # Year/Month only
-    BY_BOTH = "both"           # Category/Year/Month
+    BY_TYPE = "type"
+    BY_DATE = "date"
+    BY_BOTH = "both"
 
 
 class SkipReason(Enum):
@@ -98,7 +118,6 @@ EXTENSION_CATEGORIES = {
     '.eot': 'Fonts',
 }
 
-# Compound extensions (order matters - check longer ones first)
 COMPOUND_EXTENSIONS = {
     '.tar.gz': 'Archives',
     '.tar.bz2': 'Archives',
@@ -139,7 +158,6 @@ class OrganizeResult:
     errors: int = 0
     error_messages: list = field(default_factory=list)
     skipped_files: list = field(default_factory=list)
-    # Tracks actual moves: list of (original_path, final_destination)
     move_log: list = field(default_factory=list)
     cancelled: bool = False
 
@@ -162,47 +180,34 @@ class ScanOptions:
 
 
 def is_hidden_file(file_path: Path) -> bool:
-    """Check if a file is hidden (Windows or Unix style)."""
+    """Check if a file is hidden."""
     try:
-        # Check Unix-style hidden (starts with .)
         if file_path.name.startswith('.'):
             return True
-        # Check Windows hidden attribute
         if os.name == 'nt':
             attrs = ctypes.windll.kernel32.GetFileAttributesW(str(file_path))
             if attrs != -1:
-                FILE_ATTRIBUTE_HIDDEN = 0x2
-                return bool(attrs & FILE_ATTRIBUTE_HIDDEN)
+                return bool(attrs & 0x2)
     except Exception:
         pass
     return False
 
 
 def is_system_file(file_path: Path) -> bool:
-    """Check if a file is a system file (Windows)."""
+    """Check if a file is a system file."""
     try:
         if os.name == 'nt':
             attrs = ctypes.windll.kernel32.GetFileAttributesW(str(file_path))
             if attrs != -1:
-                FILE_ATTRIBUTE_SYSTEM = 0x4
-                return bool(attrs & FILE_ATTRIBUTE_SYSTEM)
+                return bool(attrs & 0x4)
     except Exception:
         pass
     return False
 
 
-def is_read_only(file_path: Path) -> bool:
-    """Check if a file is read-only."""
-    try:
-        return not os.access(file_path, os.W_OK)
-    except Exception:
-        return True
-
-
 def is_file_locked(file_path: Path) -> bool:
     """Check if a file is locked/in use."""
     try:
-        # Try to open the file exclusively
         with open(file_path, 'r+b'):
             pass
         return False
@@ -214,27 +219,17 @@ def is_file_locked(file_path: Path) -> bool:
 
 def is_symlink_or_shortcut(file_path: Path) -> bool:
     """Check if a file is a symlink or Windows shortcut."""
-    if file_path.is_symlink():
-        return True
-    if file_path.suffix.lower() == '.lnk':
-        return True
-    return False
+    return file_path.is_symlink() or file_path.suffix.lower() == '.lnk'
 
 
 def is_system_folder(folder_path: Path) -> bool:
-    """Check if a folder is a system folder that shouldn't be organized."""
+    """Check if a folder is a system folder."""
     path_lower = str(folder_path).lower()
-
-    # Check drive root
-    if len(str(folder_path)) <= 3:  # e.g., "C:\" or "D:\"
+    if len(str(folder_path)) <= 3:
         return True
-
-    # Check known system folders
     for sys_folder in SYSTEM_FOLDERS:
         if sys_folder in path_lower:
             return True
-
-    # Check if it's under Windows directory
     if os.name == 'nt':
         try:
             windows_dir = os.environ.get('WINDIR', 'C:\\Windows').lower()
@@ -242,7 +237,6 @@ def is_system_folder(folder_path: Path) -> bool:
                 return True
         except Exception:
             pass
-
     return False
 
 
@@ -255,20 +249,22 @@ def get_compound_extension(file_path: Path) -> Optional[str]:
     return None
 
 
-def delete_empty_folders(folder_path: Path, progress_callback: Callable[[str], None] = None) -> int:
-    """Delete empty folders recursively. Returns count of deleted folders."""
-    deleted = 0
+def count_files_in_folder(folder_path: Path) -> int:
+    """Count files in a folder (non-recursive, quick count)."""
+    try:
+        return sum(1 for f in folder_path.iterdir() if f.is_file())
+    except Exception:
+        return 0
 
-    # Walk bottom-up so we delete deepest empty folders first
+
+def delete_empty_folders(folder_path: Path, progress_callback: Callable[[str], None] = None) -> int:
+    """Delete empty folders recursively."""
+    deleted = 0
     for dirpath, dirnames, filenames in os.walk(str(folder_path), topdown=False):
         dir_path = Path(dirpath)
-
-        # Skip the root folder itself
         if dir_path == folder_path:
             continue
-
         try:
-            # Check if directory is empty (no files and no subdirectories)
             if not any(dir_path.iterdir()):
                 if progress_callback:
                     progress_callback(f"Deleting empty folder: {dir_path.name}")
@@ -276,7 +272,6 @@ def delete_empty_folders(folder_path: Path, progress_callback: Callable[[str], N
                 deleted += 1
         except (PermissionError, OSError):
             pass
-
     return deleted
 
 
@@ -291,61 +286,37 @@ class FileOrganizer:
         self._cancel_requested = False
 
     def request_cancel(self):
-        """Request cancellation of the current operation."""
         self._cancel_requested = True
 
     def reset_cancel(self):
-        """Reset the cancellation flag."""
         self._cancel_requested = False
 
     def get_category(self, file_path: Path) -> str:
-        """Get the category for a file based on its extension."""
-        # Check for compound extensions first
         compound_ext = get_compound_extension(file_path)
         if compound_ext:
             return COMPOUND_EXTENSIONS[compound_ext]
-
         ext = file_path.suffix.lower()
-
-        # Handle files with no extension
         if not ext:
             return 'No Extension'
-
         return EXTENSION_CATEGORIES.get(ext, 'Other')
 
     def get_file_date(self, file_path: Path) -> tuple[datetime, bool]:
-        """
-        Get file date for organization.
-        Returns (datetime, is_valid) tuple.
-        Fallback chain: creation date -> modified date -> None (invalid)
-        """
         try:
             stat_info = file_path.stat()
-
-            # Try creation time first (Windows: st_ctime is creation time)
             ctime = stat_info.st_ctime
             mtime = stat_info.st_mtime
-
-            # Use the older of the two (more likely to be original date)
             timestamp = min(ctime, mtime)
-
-            # Sanity check: date should be reasonable (after 1980, before future)
             dt = datetime.fromtimestamp(timestamp)
             if dt.year < 1980 or dt.year > datetime.now().year + 1:
-                # Invalid date, try modified time only
                 dt = datetime.fromtimestamp(mtime)
                 if dt.year < 1980 or dt.year > datetime.now().year + 1:
                     return (None, False)
-
             return (dt, True)
-
         except (OSError, ValueError, OverflowError):
             return (None, False)
 
     def get_destination_path(self, file_path: Path, file_date: Optional[datetime] = None) -> Path:
-        """Calculate the destination path for a file based on sort mode."""
         category = self.get_category(file_path)
-
         if file_date:
             year = str(file_date.year)
             month = MONTH_NAMES[file_date.month]
@@ -357,41 +328,35 @@ class FileOrganizer:
             return self.source_folder / category / file_path.name
         elif self.sort_mode == SortMode.BY_DATE:
             return self.source_folder / year / month / file_path.name
-        else:  # BY_BOTH
+        else:
             return self.source_folder / category / year / month / file_path.name
 
     def check_path_length(self, dest_path: Path) -> bool:
-        """Check if destination path exceeds Windows path length limit."""
         return len(str(dest_path)) <= MAX_PATH_LENGTH
 
     def get_unique_destination(self, dest_path: Path) -> Path:
-        """Get a unique destination path by appending a number if needed."""
         if not dest_path.exists():
             return dest_path
-
         stem = dest_path.stem
         suffix = dest_path.suffix
         parent = dest_path.parent
         counter = 1
-
         while True:
             new_name = f"{stem}_{counter}{suffix}"
             new_path = parent / new_name
             if not new_path.exists():
                 return new_path
             counter += 1
-            if counter > 10000:  # Safety limit
+            if counter > 10000:
                 raise RuntimeError("Too many duplicate files")
 
     def is_in_correct_location(self, file_path: Path, dest_path: Path) -> bool:
-        """Check if a file is already in its correct location."""
         try:
             return file_path.resolve() == dest_path.resolve()
         except OSError:
             return False
 
     def is_in_organized_structure(self, file_path: Path) -> bool:
-        """Check if a file is already within an organized folder structure."""
         try:
             relative = file_path.relative_to(self.source_folder)
         except ValueError:
@@ -404,16 +369,13 @@ class FileOrganizer:
                 return parts[0] in valid_categories
         elif self.sort_mode == SortMode.BY_DATE:
             if len(parts) >= 3:
-                year = parts[0]
-                month = parts[1]
+                year, month = parts[0], parts[1]
                 if (year.isdigit() and len(year) == 4) or year == "Unknown":
                     if month in MONTH_NAMES.values() or month == "Unknown":
                         return True
-        else:  # BY_BOTH
+        else:
             if len(parts) >= 4:
-                category = parts[0]
-                year = parts[1]
-                month = parts[2]
+                category, year, month = parts[0], parts[1], parts[2]
                 if category in valid_categories:
                     if (year.isdigit() and len(year) == 4) or year == "Unknown":
                         if month in MONTH_NAMES.values() or month == "Unknown":
@@ -421,39 +383,22 @@ class FileOrganizer:
         return False
 
     def check_file_accessibility(self, file_path: Path) -> Optional[SkipReason]:
-        """
-        Check if a file can be moved.
-        Returns SkipReason if file should be skipped, None if OK.
-        """
         try:
-            # Check symlinks/shortcuts
             if not self.options.include_symlinks and is_symlink_or_shortcut(file_path):
                 return SkipReason.SYMLINK
-
-            # Check hidden files
             if not self.options.include_hidden and is_hidden_file(file_path):
                 return SkipReason.HIDDEN_FILE
-
-            # Check system files
             if is_system_file(file_path):
                 return SkipReason.SYSTEM_FILE
-
-            # Check read-only (we can still move read-only files, but warn)
-            # Actually skip this - read-only files can usually be moved
-
-            # Check if file is locked/in use
             if is_file_locked(file_path):
                 return SkipReason.FILE_IN_USE
-
         except PermissionError:
             return SkipReason.PERMISSION_DENIED
         except Exception:
             return SkipReason.PERMISSION_DENIED
-
         return None
 
     def scan_files(self, progress_callback: Callable[[str], None] = None) -> tuple[list[FileMove], list[SkippedFile]]:
-        """Scan the source folder and plan file moves."""
         planned_moves = []
         skipped_files = []
         self.reset_cancel()
@@ -461,38 +406,28 @@ class FileOrganizer:
         for file_path in self.source_folder.rglob('*'):
             if self._cancel_requested:
                 break
-
             if not file_path.is_file():
                 continue
-
-            # Skip files already in organized structure
             if self.is_in_organized_structure(file_path):
                 continue
-
             if progress_callback:
                 progress_callback(f"Scanning: {file_path.name}")
 
-            # Check file accessibility
             skip_reason = self.check_file_accessibility(file_path)
             if skip_reason:
                 skipped_files.append(SkippedFile(file_path, skip_reason))
                 continue
 
-            # Get file date
             file_date, date_valid = self.get_file_date(file_path)
-
             dest_path = self.get_destination_path(file_path, file_date)
 
-            # Check path length
             if not self.check_path_length(dest_path):
                 skipped_files.append(SkippedFile(
-                    file_path,
-                    SkipReason.PATH_TOO_LONG,
-                    f"Path would be {len(str(dest_path))} chars (max {MAX_PATH_LENGTH})"
+                    file_path, SkipReason.PATH_TOO_LONG,
+                    f"Path would be {len(str(dest_path))} chars"
                 ))
                 continue
 
-            # Skip if already in correct location
             if self.is_in_correct_location(file_path, dest_path):
                 continue
 
@@ -506,12 +441,8 @@ class FileOrganizer:
 
         return planned_moves, skipped_files
 
-    def execute_moves(
-        self,
-        planned_moves: list[FileMove],
-        progress_callback: Callable[[int, int, str], None] = None
-    ) -> OrganizeResult:
-        """Execute the planned file moves."""
+    def execute_moves(self, planned_moves: list[FileMove],
+                      progress_callback: Callable[[int, int, str], None] = None) -> OrganizeResult:
         result = OrganizeResult()
         total = len(planned_moves)
         self.reset_cancel()
@@ -525,53 +456,32 @@ class FileOrganizer:
                 progress_callback(i + 1, total, move.source.name)
 
             try:
-                # Re-check file accessibility before moving
                 skip_reason = self.check_file_accessibility(move.source)
                 if skip_reason:
                     result.skipped += 1
                     result.skipped_files.append(SkippedFile(move.source, skip_reason))
                     continue
 
-                # Create destination directory
                 move.destination.parent.mkdir(parents=True, exist_ok=True)
-
-                # Get unique destination if file exists
                 final_dest = self.get_unique_destination(move.destination)
 
-                # Final path length check
                 if not self.check_path_length(final_dest):
                     result.skipped += 1
-                    result.skipped_files.append(SkippedFile(
-                        move.source,
-                        SkipReason.PATH_TOO_LONG
-                    ))
+                    result.skipped_files.append(SkippedFile(move.source, SkipReason.PATH_TOO_LONG))
                     continue
 
-                # Record the move before executing
                 original_path = str(move.source.resolve())
-
-                # Move the file
                 shutil.move(str(move.source), str(final_dest))
                 result.moved += 1
-
-                # Log the successful move
                 result.move_log.append((original_path, str(final_dest.resolve())))
 
             except PermissionError as e:
                 result.skipped += 1
-                result.skipped_files.append(SkippedFile(
-                    move.source,
-                    SkipReason.PERMISSION_DENIED,
-                    str(e)
-                ))
+                result.skipped_files.append(SkippedFile(move.source, SkipReason.PERMISSION_DENIED, str(e)))
             except OSError as e:
                 if "being used" in str(e).lower() or "in use" in str(e).lower():
                     result.skipped += 1
-                    result.skipped_files.append(SkippedFile(
-                        move.source,
-                        SkipReason.FILE_IN_USE,
-                        str(e)
-                    ))
+                    result.skipped_files.append(SkippedFile(move.source, SkipReason.FILE_IN_USE, str(e)))
                 else:
                     result.errors += 1
                     result.error_messages.append(f"{move.source.name}: {str(e)}")
@@ -588,9 +498,7 @@ class BackupManager:
     @staticmethod
     def save_backup(source_folder: str, move_log: list[tuple[str, str]],
                     sort_mode: str, skipped_files: list[SkippedFile] = None) -> Path:
-        """Save a backup of file moves to a JSON file."""
         BACKUP_DIR.mkdir(exist_ok=True)
-
         timestamp = datetime.now()
         filename = f"backup_{timestamp.strftime('%Y%m%d_%H%M%S')}.json"
         backup_path = BACKUP_DIR / filename
@@ -600,31 +508,21 @@ class BackupManager:
             "source_folder": source_folder,
             "sort_mode": sort_mode,
             "file_count": len(move_log),
-            "moves": [
-                {"original": orig, "destination": dest}
-                for orig, dest in move_log
-            ],
+            "moves": [{"original": orig, "destination": dest} for orig, dest in move_log],
             "skipped": [
-                {
-                    "path": str(sf.path),
-                    "reason": sf.reason.value,
-                    "details": sf.details
-                }
+                {"path": str(sf.path), "reason": sf.reason.value, "details": sf.details}
                 for sf in (skipped_files or [])
             ]
         }
 
         with open(backup_path, 'w', encoding='utf-8') as f:
             json.dump(backup_data, f, indent=2, ensure_ascii=False)
-
         return backup_path
 
     @staticmethod
     def list_backups() -> list[BackupInfo]:
-        """List all available backup files."""
         if not BACKUP_DIR.exists():
             return []
-
         backups = []
         for filepath in BACKUP_DIR.glob("backup_*.json"):
             try:
@@ -638,23 +536,18 @@ class BackupManager:
                 ))
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
-
         backups.sort(key=lambda b: b.timestamp, reverse=True)
         return backups
 
     @staticmethod
     def load_backup(filepath: Path) -> dict:
-        """Load a backup file and return its data."""
         with open(filepath, 'r', encoding='utf-8') as f:
             return json.load(f)
 
     @staticmethod
-    def execute_restore(
-        backup_data: dict,
-        progress_callback: Callable[[int, int, str], None] = None,
-        cancel_check: Callable[[], bool] = None
-    ) -> OrganizeResult:
-        """Restore files to their original locations."""
+    def execute_restore(backup_data: dict,
+                        progress_callback: Callable[[int, int, str], None] = None,
+                        cancel_check: Callable[[], bool] = None) -> OrganizeResult:
         result = OrganizeResult()
         moves = backup_data["moves"]
         total = len(moves)
@@ -674,18 +567,14 @@ class BackupManager:
                 if not destination.exists():
                     result.skipped += 1
                     result.skipped_files.append(SkippedFile(
-                        destination,
-                        SkipReason.MOVE_ERROR,
-                        "File not found at organized location"
+                        destination, SkipReason.MOVE_ERROR, "File not found"
                     ))
                     continue
 
                 original.parent.mkdir(parents=True, exist_ok=True)
-
                 final_original = original
                 if original.exists():
-                    stem = original.stem
-                    suffix = original.suffix
+                    stem, suffix = original.stem, original.suffix
                     counter = 1
                     while final_original.exists():
                         final_original = original.parent / f"{stem}_restored_{counter}{suffix}"
@@ -697,11 +586,7 @@ class BackupManager:
 
             except PermissionError as e:
                 result.skipped += 1
-                result.skipped_files.append(SkippedFile(
-                    destination,
-                    SkipReason.PERMISSION_DENIED,
-                    str(e)
-                ))
+                result.skipped_files.append(SkippedFile(destination, SkipReason.PERMISSION_DENIED, str(e)))
             except Exception as e:
                 result.errors += 1
                 result.error_messages.append(f"{destination.name}: {str(e)}")
@@ -710,7 +595,6 @@ class BackupManager:
 
     @staticmethod
     def delete_backup(filepath: Path) -> bool:
-        """Delete a backup file."""
         try:
             filepath.unlink()
             return True
@@ -718,167 +602,19 @@ class BackupManager:
             return False
 
 
-class ModernStyle:
-    """Modern styling configuration for the application."""
-
-    # Colors
-    PRIMARY = "#2563eb"       # Blue
-    PRIMARY_HOVER = "#1d4ed8"
-    SUCCESS = "#16a34a"       # Green
-    WARNING = "#ea580c"       # Orange
-    DANGER = "#dc2626"        # Red
-
-    BG_DARK = "#1e293b"       # Dark slate
-    BG_MEDIUM = "#334155"     # Medium slate
-    BG_LIGHT = "#475569"      # Light slate
-
-    TEXT_PRIMARY = "#f8fafc"  # Almost white
-    TEXT_SECONDARY = "#cbd5e1" # Light gray (more readable)
-    TEXT_MUTED = "#94a3b8"    # Muted gray (lighter than before)
-
-    CARD_BG = "#1e293b"
-    BORDER = "#475569"
-
-    @classmethod
-    def apply(cls, root: tk.Tk):
-        """Apply modern styling to the application."""
-        style = ttk.Style()
-
-        available_themes = style.theme_names()
-        if 'clam' in available_themes:
-            style.theme_use('clam')
-
-        root.configure(bg=cls.BG_DARK)
-
-        style.configure("TFrame", background=cls.BG_DARK)
-        style.configure("Card.TFrame", background=cls.BG_MEDIUM, relief="flat")
-
-        style.configure("TLabel",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10))
-
-        style.configure("Header.TLabel",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 24, "bold"))
-
-        style.configure("Subheader.TLabel",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_SECONDARY,
-                       font=("Segoe UI", 11))
-
-        style.configure("Section.TLabel",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 11, "bold"))
-
-        style.configure("Card.TLabel",
-                       background=cls.BG_MEDIUM,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10))
-
-        style.configure("Status.TLabel",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 9))
-
-        style.configure("TButton",
-                       background=cls.PRIMARY,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10),
-                       padding=(16, 8),
-                       borderwidth=0)
-
-        style.map("TButton",
-                 background=[("active", cls.PRIMARY_HOVER), ("disabled", cls.BG_LIGHT)],
-                 foreground=[("disabled", cls.TEXT_MUTED)])
-
-        style.configure("Accent.TButton",
-                       background=cls.SUCCESS,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10, "bold"),
-                       padding=(20, 10))
-
-        style.map("Accent.TButton",
-                 background=[("active", "#15803d"), ("disabled", cls.BG_LIGHT)])
-
-        style.configure("Secondary.TButton",
-                       background=cls.BG_MEDIUM,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10),
-                       padding=(16, 8))
-
-        style.map("Secondary.TButton",
-                 background=[("active", cls.BG_LIGHT), ("disabled", cls.BG_LIGHT)])
-
-        style.configure("Danger.TButton",
-                       background=cls.DANGER,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10),
-                       padding=(16, 8))
-
-        style.map("Danger.TButton",
-                 background=[("active", "#b91c1c"), ("disabled", cls.BG_LIGHT)])
-
-        style.configure("TEntry",
-                       fieldbackground=cls.BG_MEDIUM,
-                       foreground=cls.TEXT_PRIMARY,
-                       insertcolor=cls.TEXT_PRIMARY,
-                       padding=8)
-
-        style.configure("TCheckbutton",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10))
-
-        style.map("TCheckbutton",
-                 background=[("active", cls.BG_DARK)])
-
-        style.configure("Card.TCheckbutton",
-                       background=cls.BG_MEDIUM,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10))
-
-        style.configure("TRadiobutton",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10),
-                       padding=4)
-
-        style.configure("Card.TRadiobutton",
-                       background=cls.BG_MEDIUM,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10),
-                       padding=4)
-
-        style.configure("TProgressbar",
-                       background=cls.PRIMARY,
-                       troughcolor=cls.BG_MEDIUM,
-                       borderwidth=0,
-                       thickness=8)
-
-        style.configure("TLabelframe",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY)
-
-        style.configure("TLabelframe.Label",
-                       background=cls.BG_DARK,
-                       foreground=cls.TEXT_PRIMARY,
-                       font=("Segoe UI", 10, "bold"))
-
-
 class FileOrganizerApp:
-    """Main application GUI."""
+    """Main application GUI using ttkbootstrap."""
 
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title(f"{APP_NAME}")
-        self.root.geometry("750x750")
-        self.root.minsize(650, 650)
-        self.root.resizable(True, True)
+        # Create window with ttkbootstrap theme
+        if TTKBOOTSTRAP_AVAILABLE:
+            self.root = ttk.Window(themename="superhero")
+        else:
+            self.root = tk.Tk()
 
-        ModernStyle.apply(self.root)
+        self.root.title(APP_NAME)
+        self.root.geometry("850x900")
+        self.root.minsize(750, 800)
 
         # Variables
         self.selected_folder = tk.StringVar()
@@ -891,348 +627,227 @@ class FileOrganizerApp:
         self.skipped_files: list[SkippedFile] = []
         self.organizer: Optional[FileOrganizer] = None
         self.is_processing = False
+        self.file_count = 0
 
         self._create_widgets()
         self._center_window()
 
     def _center_window(self):
-        """Center the window on screen."""
         self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.root.winfo_screenheight() // 2) - (height // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def _create_widgets(self):
-        """Create the GUI widgets."""
-        main_frame = ttk.Frame(self.root, padding="20")
-        main_frame.grid(row=0, column=0, sticky="nsew")
+        # Main container with padding
+        self.main_frame = ttk.Frame(self.root, padding=30)
+        self.main_frame.pack(fill="both", expand=True)
 
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
+        self._create_header()
+        self._create_folder_section()
+        self._create_mode_section()
+        self._create_options_section()
+        self._create_action_buttons()
+        self._create_progress_section()
+        self._create_results_section()
+        self._create_footer()
 
-        self._create_header(main_frame)
-        self._create_folder_section(main_frame)
-        self._create_sort_options(main_frame)
-        self._create_advanced_options(main_frame)
-        self._create_action_buttons(main_frame)
-        self._create_progress_section(main_frame)
-        self._create_results_section(main_frame)
-        self._create_footer(main_frame)
+    def _bootstyle(self, style: str) -> dict:
+        """Return bootstyle kwarg only if ttkbootstrap is available."""
+        if TTKBOOTSTRAP_AVAILABLE:
+            return {"bootstyle": style}
+        return {}
 
-    def _create_header(self, parent):
-        """Create the header section."""
-        header_frame = ttk.Frame(parent)
-        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 16))
-        header_frame.columnconfigure(0, weight=1)
+    def _create_header(self):
+        header = ttk.Frame(self.main_frame)
+        header.pack(fill="x", pady=(0, 20))
 
-        ttk.Label(
-            header_frame,
-            text=APP_NAME,
-            style="Header.TLabel"
-        ).grid(row=0, column=0, sticky="w")
+        title = ttk.Label(header, text=APP_NAME, font=("Segoe UI", 28, "bold"))
+        title.pack(anchor="w")
 
-        ttk.Label(
-            header_frame,
-            text="Automatically organize your files by type and date",
-            style="Subheader.TLabel"
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        subtitle = ttk.Label(header, text="Automatically organize your files by type and date",
+                            font=("Segoe UI", 11), **self._bootstyle("secondary"))
+        subtitle.pack(anchor="w", pady=(4, 0))
 
-    def _create_folder_section(self, parent):
-        """Create the folder selection section."""
-        section_frame = ttk.Frame(parent)
-        section_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        section_frame.columnconfigure(1, weight=1)
+    def _create_folder_section(self):
+        card = ttk.Labelframe(self.main_frame, text=f"  {ICON_FOLDER}  Select Folder  ", padding=20)
+        card.pack(fill="x", pady=(0, 15))
 
-        ttk.Label(
-            section_frame,
-            text="Select Folder",
-            style="Section.TLabel"
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        # Folder info label (shows after selection)
+        self.folder_info = ttk.Label(card, text="No folder selected", **self._bootstyle("secondary"))
+        self.folder_info.pack(anchor="w", pady=(0, 10))
 
-        self.folder_entry = tk.Entry(
-            section_frame,
-            textvariable=self.selected_folder,
-            state="readonly",
-            font=("Segoe UI", 10),
-            bg=ModernStyle.BG_MEDIUM,
-            fg=ModernStyle.TEXT_PRIMARY,
-            insertbackground=ModernStyle.TEXT_PRIMARY,
-            relief="flat",
-            readonlybackground=ModernStyle.BG_MEDIUM
-        )
-        self.folder_entry.grid(row=1, column=0, sticky="ew", ipady=8, padx=(0, 8))
-        section_frame.columnconfigure(0, weight=1)
+        # Input row
+        input_row = ttk.Frame(card)
+        input_row.pack(fill="x")
 
-        self.browse_btn = ttk.Button(
-            section_frame,
-            text="Browse...",
-            command=self._browse_folder,
-            style="Secondary.TButton"
-        )
-        self.browse_btn.grid(row=1, column=1, sticky="e")
+        self.folder_entry = ttk.Entry(input_row, textvariable=self.selected_folder,
+                                     font=("Segoe UI", 10), state="readonly")
+        self.folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-    def _create_sort_options(self, parent):
-        """Create the sorting options section."""
-        section_frame = ttk.Frame(parent)
-        section_frame.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self.browse_btn = ttk.Button(input_row, text="Browse...", command=self._browse_folder,
+                                     **self._bootstyle("secondary"))
+        self.browse_btn.pack(side="right")
 
-        ttk.Label(
-            section_frame,
-            text="Organization Mode",
-            style="Section.TLabel"
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+    def _create_mode_section(self):
+        card = ttk.Labelframe(self.main_frame, text="  Organization Mode  ", padding=20)
+        card.pack(fill="x", pady=(0, 15))
 
-        options_card = tk.Frame(
-            section_frame,
-            bg=ModernStyle.BG_MEDIUM,
-            padx=16,
-            pady=12
-        )
-        options_card.grid(row=1, column=0, sticky="ew")
-        section_frame.columnconfigure(0, weight=1)
-
-        options = [
-            (SortMode.BY_TYPE.value, "By Type", "Images/, Documents/, Videos/..."),
-            (SortMode.BY_DATE.value, "By Date", "2024/01-January/, 2024/02-February/..."),
-            (SortMode.BY_BOTH.value, "By Type & Date", "Images/2024/01-January/... (Recommended)"),
+        modes = [
+            (SortMode.BY_TYPE.value, f"{ICON_FOLDER}  By Type",
+             "Organize into category folders: Images/, Documents/, Videos/..."),
+            (SortMode.BY_DATE.value, f"{ICON_CALENDAR}  By Date",
+             "Organize by year and month: 2024/01-January/..."),
+            (SortMode.BY_BOTH.value, f"{ICON_FOLDER} {ICON_CALENDAR}  By Type & Date  (Recommended)",
+             "Combined: Images/2024/01-January/..."),
         ]
 
-        for i, (value, label, desc) in enumerate(options):
-            opt_frame = tk.Frame(options_card, bg=ModernStyle.BG_MEDIUM)
-            opt_frame.grid(row=i, column=0, sticky="w", pady=4)
+        for value, label, desc in modes:
+            frame = ttk.Frame(card)
+            frame.pack(fill="x", pady=4)
 
-            rb = tk.Radiobutton(
-                opt_frame,
-                text=label,
-                variable=self.sort_mode,
-                value=value,
-                font=("Segoe UI", 10),
-                bg=ModernStyle.BG_MEDIUM,
-                fg=ModernStyle.TEXT_PRIMARY,
-                selectcolor=ModernStyle.BG_DARK,
-                activebackground=ModernStyle.BG_MEDIUM,
-                activeforeground=ModernStyle.TEXT_PRIMARY,
-                highlightthickness=0
-            )
-            rb.grid(row=0, column=0, sticky="w")
+            rb = ttk.Radiobutton(frame, text=label, variable=self.sort_mode, value=value,
+                                **self._bootstyle("primary-toolbutton"))
+            rb.pack(anchor="w")
 
-            desc_label = tk.Label(
-                opt_frame,
-                text=f"  {desc}",
-                font=("Segoe UI", 9),
-                bg=ModernStyle.BG_MEDIUM,
-                fg=ModernStyle.TEXT_SECONDARY
-            )
-            desc_label.grid(row=0, column=1, sticky="w")
+            desc_label = ttk.Label(frame, text=desc, font=("Segoe UI", 9), **self._bootstyle("secondary"))
+            desc_label.pack(anchor="w", padx=(28, 0))
 
-    def _create_advanced_options(self, parent):
-        """Create the advanced options section."""
-        section_frame = ttk.Frame(parent)
-        section_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+    def _create_options_section(self):
+        card = ttk.Labelframe(self.main_frame, text="  Options  ", padding=20)
+        card.pack(fill="x", pady=(0, 15))
 
-        ttk.Label(
-            section_frame,
-            text="Options",
-            style="Section.TLabel"
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        options_frame = ttk.Frame(card)
+        options_frame.pack(fill="x")
 
-        options_card = tk.Frame(
-            section_frame,
-            bg=ModernStyle.BG_MEDIUM,
-            padx=16,
-            pady=12
-        )
-        options_card.grid(row=1, column=0, sticky="ew")
-        section_frame.columnconfigure(0, weight=1)
+        # Row 1
+        row1 = ttk.Frame(options_frame)
+        row1.pack(fill="x", pady=4)
 
-        # Row 1: Hidden files and symlinks
-        row1 = tk.Frame(options_card, bg=ModernStyle.BG_MEDIUM)
-        row1.grid(row=0, column=0, sticky="w", pady=2)
+        cb_hidden = ttk.Checkbutton(row1, text="Include hidden files", variable=self.include_hidden,
+                                    **self._bootstyle("round-toggle"))
+        cb_hidden.pack(side="left", padx=(0, 40))
 
-        cb_hidden = tk.Checkbutton(
-            row1,
-            text="Include hidden files",
-            variable=self.include_hidden,
-            font=("Segoe UI", 10),
-            bg=ModernStyle.BG_MEDIUM,
-            fg=ModernStyle.TEXT_PRIMARY,
-            selectcolor=ModernStyle.BG_DARK,
-            activebackground=ModernStyle.BG_MEDIUM,
-            activeforeground=ModernStyle.TEXT_PRIMARY,
-            highlightthickness=0
-        )
-        cb_hidden.pack(side="left", padx=(0, 20))
-
-        cb_symlinks = tk.Checkbutton(
-            row1,
-            text="Include shortcuts/symlinks",
-            variable=self.include_symlinks,
-            font=("Segoe UI", 10),
-            bg=ModernStyle.BG_MEDIUM,
-            fg=ModernStyle.TEXT_PRIMARY,
-            selectcolor=ModernStyle.BG_DARK,
-            activebackground=ModernStyle.BG_MEDIUM,
-            activeforeground=ModernStyle.TEXT_PRIMARY,
-            highlightthickness=0
-        )
+        cb_symlinks = ttk.Checkbutton(row1, text="Include shortcuts & symlinks",
+                                     variable=self.include_symlinks,
+                                     **self._bootstyle("round-toggle"))
         cb_symlinks.pack(side="left")
 
-        # Row 2: Delete empty folders
-        row2 = tk.Frame(options_card, bg=ModernStyle.BG_MEDIUM)
-        row2.grid(row=1, column=0, sticky="w", pady=2)
+        # Row 2
+        row2 = ttk.Frame(options_frame)
+        row2.pack(fill="x", pady=4)
 
-        cb_empty = tk.Checkbutton(
-            row2,
-            text="Delete empty folders after organizing",
-            variable=self.delete_empty,
-            font=("Segoe UI", 10),
-            bg=ModernStyle.BG_MEDIUM,
-            fg=ModernStyle.TEXT_PRIMARY,
-            selectcolor=ModernStyle.BG_DARK,
-            activebackground=ModernStyle.BG_MEDIUM,
-            activeforeground=ModernStyle.TEXT_PRIMARY,
-            highlightthickness=0
-        )
+        cb_empty = ttk.Checkbutton(row2, text="Delete empty folders after organizing",
+                                  variable=self.delete_empty,
+                                  **self._bootstyle("round-toggle"))
         cb_empty.pack(side="left")
 
-    def _create_action_buttons(self, parent):
-        """Create the action buttons section."""
-        btn_frame = ttk.Frame(parent)
-        btn_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+    def _create_action_buttons(self):
+        btn_frame = ttk.Frame(self.main_frame)
+        btn_frame.pack(fill="x", pady=(0, 20))
 
-        left_frame = ttk.Frame(btn_frame)
-        left_frame.pack(side="left")
+        # Left side buttons
+        left_btns = ttk.Frame(btn_frame)
+        left_btns.pack(side="left")
 
-        self.preview_btn = ttk.Button(
-            left_frame,
-            text="Preview Changes",
-            command=self._preview,
-            style="Secondary.TButton"
-        )
-        self.preview_btn.pack(side="left", padx=(0, 8))
+        self.preview_btn = ttk.Button(left_btns, text="Preview Changes", command=self._preview,
+                                      **self._bootstyle("info-outline"))
+        self.preview_btn.pack(side="left", padx=(0, 10))
 
-        self.organize_btn = ttk.Button(
-            left_frame,
-            text="Organize Files",
-            command=self._organize,
-            style="Accent.TButton"
-        )
-        self.organize_btn.pack(side="left", padx=(0, 8))
+        self.organize_btn = ttk.Button(left_btns, text="Organize Files", command=self._organize,
+                                       **self._bootstyle("success"))
+        self.organize_btn.pack(side="left", padx=(0, 10))
 
-        self.cancel_btn = ttk.Button(
-            left_frame,
-            text="Cancel",
-            command=self._cancel_operation,
-            style="Danger.TButton"
-        )
-        self.cancel_btn.pack(side="left", padx=(0, 8))
-        self.cancel_btn.pack_forget()  # Hide initially
+        self.cancel_btn = ttk.Button(left_btns, text="Cancel", command=self._cancel_operation,
+                                     **self._bootstyle("danger"))
+        # Hidden initially
 
-        self.restore_btn = ttk.Button(
-            btn_frame,
-            text="Restore...",
-            command=self._show_restore_dialog,
-            style="Secondary.TButton"
-        )
+        # Right side
+        self.restore_btn = ttk.Button(btn_frame, text="Restore...", command=self._show_restore_dialog,
+                                      **self._bootstyle("secondary-link"))
         self.restore_btn.pack(side="right")
 
         self._update_button_states()
 
-    def _create_progress_section(self, parent):
-        """Create the progress section."""
-        progress_frame = ttk.Frame(parent)
-        progress_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
-        progress_frame.columnconfigure(0, weight=1)
+    def _create_progress_section(self):
+        self.progress_frame = ttk.Frame(self.main_frame)
+        self.progress_frame.pack(fill="x", pady=(0, 15))
 
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            progress_frame,
-            variable=self.progress_var,
-            maximum=100,
-            style="TProgressbar"
-        )
-        self.progress_bar.grid(row=0, column=0, sticky="ew")
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode="determinate",
+                                            **self._bootstyle("success-striped"))
+        self.progress_bar.pack(fill="x")
+
+        # Status row
+        status_row = ttk.Frame(self.progress_frame)
+        status_row.pack(fill="x", pady=(8, 0))
 
         self.status_var = tk.StringVar(value="Select a folder to get started")
-        self.status_label = ttk.Label(
-            progress_frame,
-            textvariable=self.status_var,
-            style="Status.TLabel"
-        )
-        self.status_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.status_label = ttk.Label(status_row, textvariable=self.status_var,
+                                     font=("Segoe UI", 10), **self._bootstyle("secondary"))
+        self.status_label.pack(side="left")
 
-    def _create_results_section(self, parent):
-        """Create the results section."""
-        results_frame = ttk.Frame(parent)
-        results_frame.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
-        results_frame.columnconfigure(0, weight=1)
-        results_frame.rowconfigure(1, weight=1)
-        parent.rowconfigure(6, weight=1)
+        self.progress_pct = ttk.Label(status_row, text="", font=("Segoe UI", 10, "bold"),
+                                     **self._bootstyle("success"))
+        self.progress_pct.pack(side="right")
 
-        ttk.Label(
-            results_frame,
-            text="Results",
-            style="Section.TLabel"
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+    def _create_results_section(self):
+        card = ttk.Labelframe(self.main_frame, text="  Results  ", padding=15)
+        card.pack(fill="both", expand=True, pady=(0, 15))
 
-        text_container = tk.Frame(
-            results_frame,
-            bg=ModernStyle.BG_MEDIUM,
-            padx=2,
-            pady=2
-        )
-        text_container.grid(row=1, column=0, sticky="nsew")
-        text_container.columnconfigure(0, weight=1)
-        text_container.rowconfigure(0, weight=1)
+        # Header with summary
+        header_row = ttk.Frame(card)
+        header_row.pack(fill="x", pady=(0, 10))
 
-        self.results_text = tk.Text(
-            text_container,
-            height=10,
-            font=("Consolas", 9),
-            bg=ModernStyle.BG_DARK,
-            fg=ModernStyle.TEXT_PRIMARY,
-            insertbackground=ModernStyle.TEXT_PRIMARY,
-            relief="flat",
-            padx=12,
-            pady=12,
-            state="disabled",
-            wrap="word"
-        )
-        self.results_text.grid(row=0, column=0, sticky="nsew")
+        self.results_summary = ttk.Label(header_row, text="", **self._bootstyle("secondary"))
+        self.results_summary.pack(side="right")
 
-        scrollbar = ttk.Scrollbar(
-            text_container,
-            orient="vertical",
-            command=self.results_text.yview
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.results_text.configure(yscrollcommand=scrollbar.set)
+        # Status indicator frame (shown after operations)
+        self.status_indicator = ttk.Frame(card)
 
-    def _create_footer(self, parent):
-        """Create the footer section."""
-        footer_frame = ttk.Frame(parent)
-        footer_frame.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        # Results container with scrollbar
+        if TTKBOOTSTRAP_AVAILABLE:
+            self.results_scroll = ScrolledFrame(card, autohide=True)
+            self.results_scroll.pack(fill="both", expand=True)
+            self.results_inner = self.results_scroll
+        else:
+            results_container = ttk.Frame(card)
+            results_container.pack(fill="both", expand=True)
 
-        ttk.Label(
-            footer_frame,
-            text=f"v{APP_VERSION}",
-            style="Status.TLabel"
-        ).pack(side="right")
+            canvas = tk.Canvas(results_container, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(results_container, orient="vertical", command=canvas.yview)
+
+            self.results_inner = ttk.Frame(canvas)
+            self.results_inner.bind("<Configure>",
+                                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+            canvas.create_window((0, 0), window=self.results_inner, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+
+            canvas.bind_all("<MouseWheel>",
+                           lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def _create_footer(self):
+        footer = ttk.Frame(self.main_frame)
+        footer.pack(fill="x")
+
+        version = ttk.Label(footer, text=f"v{APP_VERSION}", font=("Segoe UI", 9),
+                           **self._bootstyle("secondary"))
+        version.pack(side="right")
 
     def _browse_folder(self):
-        """Open folder browser dialog."""
         folder = filedialog.askdirectory(title="Select Folder to Organize")
         if folder:
             folder_path = Path(folder)
 
-            # Warn about system folders
             if is_system_folder(folder_path):
                 if not messagebox.askyesno(
                     "Warning",
-                    "This appears to be a system folder or critical location.\n\n"
+                    f"{ICON_WARNING} This appears to be a system folder.\n\n"
                     "Organizing files here could cause problems.\n\n"
                     "Are you sure you want to continue?",
                     icon="warning"
@@ -1244,73 +859,99 @@ class FileOrganizerApp:
             self.skipped_files = []
             self._clear_results()
             self._update_button_states()
+
+            # Count files and update info
+            self.file_count = count_files_in_folder(folder_path)
+            folder_name = folder_path.name
+            self.folder_info.configure(text=f"{ICON_FOLDER}  {folder_name}  -  {self.file_count} files")
+
             self.status_var.set("Folder selected. Click 'Preview Changes' to see what will happen.")
-            self.progress_var.set(0)
-
-            # Check if folder appears to already be organized
-            self._check_already_organized(folder_path)
-
-    def _check_already_organized(self, folder_path: Path):
-        """Check if folder appears to already be organized and warn user."""
-        valid_categories = set(EXTENSION_CATEGORIES.values()) | {'Other', 'No Extension'}
-
-        organized_folders = 0
-        total_subfolders = 0
-
-        try:
-            for item in folder_path.iterdir():
-                if item.is_dir():
-                    total_subfolders += 1
-                    if item.name in valid_categories:
-                        organized_folders += 1
-                    # Check for year folders
-                    elif item.name.isdigit() and len(item.name) == 4:
-                        organized_folders += 1
-        except PermissionError:
-            pass
-
-        if total_subfolders > 0 and organized_folders / total_subfolders > 0.5:
-            self._append_result("Note: This folder appears to already be partially organized.")
-            self._append_result("Files in the existing structure will be skipped.\n")
+            self._set_progress(0)
 
     def _update_button_states(self):
-        """Update button enabled/disabled states."""
         has_folder = bool(self.selected_folder.get())
-        state = "normal" if has_folder and not self.is_processing else "disabled"
+        enabled = has_folder and not self.is_processing
+
+        state = "normal" if enabled else "disabled"
         self.preview_btn.configure(state=state)
         self.organize_btn.configure(state=state)
-        self.browse_btn.configure(state="disabled" if self.is_processing else "normal")
-        self.restore_btn.configure(state="disabled" if self.is_processing else "normal")
+        self.browse_btn.configure(state="normal" if not self.is_processing else "disabled")
+        self.restore_btn.configure(state="normal" if not self.is_processing else "disabled")
 
     def _show_cancel_button(self, show: bool):
-        """Show or hide the cancel button."""
         if show:
-            self.cancel_btn.pack(side="left", padx=(0, 8))
+            self.cancel_btn.pack(side="left", padx=(0, 10))
         else:
             self.cancel_btn.pack_forget()
 
     def _cancel_operation(self):
-        """Cancel the current operation."""
         if self.organizer:
             self.organizer.request_cancel()
             self.status_var.set("Cancelling...")
 
     def _clear_results(self):
-        """Clear the results text area."""
-        self.results_text.configure(state="normal")
-        self.results_text.delete("1.0", tk.END)
-        self.results_text.configure(state="disabled")
+        for widget in self.results_inner.winfo_children():
+            widget.destroy()
+        self.results_summary.configure(text="")
+        self.status_indicator.pack_forget()
 
-    def _append_result(self, text: str, tag: str = None):
-        """Append text to results area."""
-        self.results_text.configure(state="normal")
-        self.results_text.insert(tk.END, text + "\n", tag)
-        self.results_text.see(tk.END)
-        self.results_text.configure(state="disabled")
-        self.root.update_idletasks()
+    def _set_progress(self, percent: float):
+        self.progress_bar["value"] = percent
+        if percent > 0:
+            self.progress_pct.configure(text=f"{int(percent)}%")
+        else:
+            self.progress_pct.configure(text="")
+
+    def _add_result_header(self, text: str, icon: str = "", style: str = ""):
+        frame = ttk.Frame(self.results_inner)
+        frame.pack(fill="x", pady=(12, 6))
+
+        full_text = f"{icon}  {text}" if icon else text
+        label = ttk.Label(frame, text=full_text, font=("Segoe UI", 11, "bold"),
+                         **self._bootstyle(style) if style else {})
+        label.pack(side="left")
+
+    def _add_result_item(self, icon: str, text: str, style: str = "", indent: int = 0):
+        frame = ttk.Frame(self.results_inner, padding=(indent * 20, 2, 0, 2))
+        frame.pack(fill="x")
+
+        full_text = f"{icon}  {text}" if icon else text
+        label = ttk.Label(frame, text=full_text, font=("Segoe UI", 10),
+                         **self._bootstyle(style) if style else {})
+        label.pack(side="left")
+
+    def _add_tree_item(self, text: str, level: int = 0):
+        frame = ttk.Frame(self.results_inner)
+        frame.pack(fill="x", pady=1)
+
+        indent = "    " * level
+        prefix = "--- " if level > 0 else ""
+
+        label = ttk.Label(frame, text=f"{indent}{prefix}{text}",
+                         font=("Consolas", 10), **self._bootstyle("secondary"))
+        label.pack(side="left")
+
+    def _show_success_state(self, moved: int, skipped: int, errors: int):
+        self.status_indicator.pack(fill="x", pady=(0, 12))
+        for widget in self.status_indicator.winfo_children():
+            widget.destroy()
+
+        if errors == 0 and skipped == 0:
+            style = "success"
+            indicator_text = f"{ICON_CHECK}  Successfully organized {moved} files"
+        elif errors > 0:
+            style = "danger"
+            indicator_text = f"{ICON_ERROR}  Completed with {errors} errors"
+        else:
+            style = "warning"
+            indicator_text = f"{ICON_WARNING}  Completed with {skipped} files skipped"
+
+        indicator = ttk.Label(self.status_indicator, text=indicator_text,
+                             font=("Segoe UI", 12, "bold"),
+                             **self._bootstyle(f"inverse-{style}"))
+        indicator.pack(fill="x", pady=12)
 
     def _get_sort_mode(self) -> SortMode:
-        """Get the current sort mode."""
         value = self.sort_mode.get()
         for mode in SortMode:
             if mode.value == value:
@@ -1318,7 +959,6 @@ class FileOrganizerApp:
         return SortMode.BY_BOTH
 
     def _get_scan_options(self) -> ScanOptions:
-        """Get the current scan options."""
         return ScanOptions(
             include_hidden=self.include_hidden.get(),
             include_symlinks=self.include_symlinks.get(),
@@ -1326,14 +966,13 @@ class FileOrganizerApp:
         )
 
     def _preview(self):
-        """Run preview/dry-run mode."""
         folder = self.selected_folder.get()
         if not folder:
             messagebox.showwarning("No Folder", "Please select a folder first.")
             return
 
         self._clear_results()
-        self.progress_var.set(0)
+        self._set_progress(0)
         self.status_var.set("Scanning files...")
         self.is_processing = True
         self._update_button_states()
@@ -1348,9 +987,7 @@ class FileOrganizerApp:
             self.status_var.set(msg)
             self.root.update_idletasks()
 
-        self.planned_moves, self.skipped_files = self.organizer.scan_files(
-            progress_callback=scan_progress
-        )
+        self.planned_moves, self.skipped_files = self.organizer.scan_files(progress_callback=scan_progress)
 
         self.is_processing = False
         self._update_button_states()
@@ -1358,34 +995,72 @@ class FileOrganizerApp:
 
         if self.organizer._cancel_requested:
             self.status_var.set("Preview cancelled.")
-            self._append_result("Preview was cancelled by user.")
+            self._add_result_header("Preview was cancelled", ICON_WARNING, "warning")
             return
 
-        # Show summary
-        mode_desc = {
-            SortMode.BY_TYPE: "by type only",
-            SortMode.BY_DATE: "by date only",
-            SortMode.BY_BOTH: "by type and date"
-        }
+        # Show dry run notice
+        dry_run_frame = ttk.Frame(self.results_inner)
+        dry_run_frame.pack(fill="x", pady=(0, 12))
+
+        dry_run_label = ttk.Label(dry_run_frame,
+                                 text=f"{ICON_FILE}  DRY RUN - No files have been moved yet",
+                                 font=("Segoe UI", 10, "bold"),
+                                 **self._bootstyle("info"))
+        dry_run_label.pack(pady=8)
 
         if not self.planned_moves and not self.skipped_files:
             self.status_var.set("No files need to be organized.")
-            self._append_result("No files found that need organizing.")
-            self._append_result("Files may already be in the correct location.")
+            self._add_result_header("No files to organize", ICON_CHECK, "success")
+            self._add_result_item("", "All files are already in the correct location", "secondary", 1)
             return
 
-        self._append_result(f"PREVIEW SUMMARY")
-        self._append_result("=" * 55)
-        self._append_result(f"\nFiles to organize: {len(self.planned_moves)}")
-        self._append_result(f"Files skipped: {len(self.skipped_files)}")
-        self._append_result(f"Organization mode: {mode_desc[sort_mode]}\n")
+        # Summary
+        self.results_summary.configure(
+            text=f"{len(self.planned_moves)} to move, {len(self.skipped_files)} skipped"
+        )
 
-        # Show skipped files by reason
+        # Show folder structure preview
+        if self.planned_moves:
+            self._add_result_header(f"Folder Structure Preview ({len(self.planned_moves)} files)")
+
+            # Build tree structure
+            categories = {}
+            for move in self.planned_moves:
+                if move.category not in categories:
+                    categories[move.category] = {"years": {}, "count": 0}
+                categories[move.category]["count"] += 1
+
+                if sort_mode != SortMode.BY_TYPE:
+                    year = str(move.year) if move.year else "Unknown"
+                    if year not in categories[move.category]["years"]:
+                        categories[move.category]["years"][year] = {"months": set(), "count": 0}
+                    categories[move.category]["years"][year]["count"] += 1
+                    month = MONTH_NAMES.get(move.month, "Unknown") if move.month else "Unknown"
+                    categories[move.category]["years"][year]["months"].add(month)
+
+            # Display tree
+            folder_name = Path(folder).name
+            self._add_tree_item(f"{ICON_FOLDER} {folder_name}/", 0)
+
+            for cat, cat_data in sorted(categories.items()):
+                if sort_mode == SortMode.BY_TYPE:
+                    self._add_tree_item(f"{ICON_FOLDER} {cat}/  ({cat_data['count']} files)", 1)
+                elif sort_mode == SortMode.BY_DATE:
+                    for year, year_data in sorted(cat_data["years"].items()):
+                        self._add_tree_item(f"{ICON_FOLDER} {year}/", 1)
+                        for month in sorted(year_data["months"]):
+                            self._add_tree_item(f"{ICON_FOLDER} {month}/", 2)
+                else:
+                    self._add_tree_item(f"{ICON_FOLDER} {cat}/", 1)
+                    for year, year_data in sorted(cat_data["years"].items()):
+                        self._add_tree_item(f"{ICON_FOLDER} {year}/", 2)
+                        for month in sorted(year_data["months"]):
+                            self._add_tree_item(f"{ICON_FOLDER} {month}/", 3)
+
+        # Show skipped files
         if self.skipped_files:
-            self._append_result("-" * 55)
-            self._append_result("SKIPPED FILES:")
+            self._add_result_header(f"Skipped Files ({len(self.skipped_files)})", ICON_WARNING, "warning")
 
-            # Group by reason
             by_reason = {}
             for sf in self.skipped_files:
                 if sf.reason not in by_reason:
@@ -1393,41 +1068,13 @@ class FileOrganizerApp:
                 by_reason[sf.reason].append(sf)
 
             for reason, files in by_reason.items():
-                self._append_result(f"\n  {reason.value}: {len(files)} file(s)")
-                for sf in files[:3]:  # Show first 3
-                    self._append_result(f"    - {sf.path.name}")
-                if len(files) > 3:
-                    self._append_result(f"    ... and {len(files) - 3} more")
+                self._add_result_item(ICON_WARNING, f"{reason.value}: {len(files)} files",
+                                      "warning", 1)
 
-        # Show files to move
-        if self.planned_moves:
-            self._append_result("\n" + "-" * 55)
-            self._append_result("FILES TO ORGANIZE:")
-
-            # Group by category
-            categories = {}
-            for move in self.planned_moves:
-                if move.category not in categories:
-                    categories[move.category] = []
-                categories[move.category].append(move)
-
-            for category, moves in sorted(categories.items()):
-                self._append_result(f"\n  {category} ({len(moves)} files)")
-                for move in moves[:3]:
-                    rel_dest = move.destination.relative_to(Path(folder))
-                    self._append_result(f"    {move.source.name}")
-                    self._append_result(f"      -> {rel_dest}")
-                if len(moves) > 3:
-                    self._append_result(f"    ... and {len(moves) - 3} more files")
-
-        self.progress_var.set(100)
-        self.status_var.set(
-            f"Preview complete. {len(self.planned_moves)} files to organize, "
-            f"{len(self.skipped_files)} skipped."
-        )
+        self._set_progress(100)
+        self.status_var.set(f"Preview complete. {len(self.planned_moves)} files ready to organize.")
 
     def _organize(self):
-        """Execute file organization."""
         folder = self.selected_folder.get()
         if not folder:
             messagebox.showwarning("No Folder", "Please select a folder first.")
@@ -1436,7 +1083,6 @@ class FileOrganizerApp:
         sort_mode = self._get_sort_mode()
         options = self._get_scan_options()
 
-        # Scan if no preview was done
         if not self.planned_moves:
             self.organizer = FileOrganizer(folder, sort_mode, options)
             self.planned_moves, self.skipped_files = self.organizer.scan_files()
@@ -1445,19 +1091,19 @@ class FileOrganizerApp:
                 messagebox.showinfo("Nothing to Do", "No files need to be organized.")
                 return
 
-        # Confirm action
-        msg = f"This will move {len(self.planned_moves)} files."
+        # Confirmation dialog
+        msg = f"This will organize {len(self.planned_moves)} files."
         if self.skipped_files:
             msg += f"\n{len(self.skipped_files)} files will be skipped."
         if options.delete_empty_folders:
-            msg += "\n\nEmpty folders will be deleted after organizing."
-        msg += "\n\nA backup will be created automatically.\n\nContinue?"
+            msg += "\n\nEmpty folders will be deleted."
+        msg += "\n\nA backup will be created automatically."
 
         if not messagebox.askyesno("Confirm Organization", msg):
             return
 
         self._clear_results()
-        self.progress_var.set(0)
+        self._set_progress(0)
         self.is_processing = True
         self._update_button_states()
         self._show_cancel_button(True)
@@ -1466,23 +1112,19 @@ class FileOrganizerApp:
 
         def move_progress(current, total, filename):
             percent = (current / total) * 100
-            self.progress_var.set(percent)
-            self.status_var.set(f"Moving ({current}/{total}): {filename}")
+            self._set_progress(percent)
+            self.status_var.set(f"Moving file {current} of {total}: {filename}")
             self.root.update_idletasks()
 
         result = self.organizer.execute_moves(self.planned_moves, progress_callback=move_progress)
-
-        # Combine skipped files from scan and execution
         all_skipped = self.skipped_files + result.skipped_files
 
         # Save backup
         backup_path = None
         if result.move_log:
-            backup_path = BackupManager.save_backup(
-                folder, result.move_log, sort_mode.value, all_skipped
-            )
+            backup_path = BackupManager.save_backup(folder, result.move_log, sort_mode.value, all_skipped)
 
-        # Delete empty folders if requested
+        # Delete empty folders
         deleted_folders = 0
         if options.delete_empty_folders and result.moved > 0:
             self.status_var.set("Cleaning up empty folders...")
@@ -1493,76 +1135,68 @@ class FileOrganizerApp:
         self._update_button_states()
         self._show_cancel_button(False)
 
-        # Show results
-        self._append_result("ORGANIZATION COMPLETE")
-        self._append_result("=" * 55)
+        # Show success/error state
+        self._show_success_state(result.moved, len(all_skipped), result.errors)
 
+        # Update summary
+        self.results_summary.configure(
+            text=f"{result.moved} moved, {len(all_skipped)} skipped, {result.errors} errors"
+        )
+
+        # Results details
         if result.cancelled:
-            self._append_result("\n*** OPERATION WAS CANCELLED ***\n")
+            self._add_result_header("Operation Cancelled", ICON_WARNING, "warning")
 
-        self._append_result(f"\nFiles moved: {result.moved}")
-        self._append_result(f"Files skipped: {result.skipped + len(self.skipped_files)}")
-        self._append_result(f"Errors: {result.errors}")
+        self._add_result_header(f"Moved ({result.moved} files)", ICON_CHECK, "success")
+        if result.move_log:
+            for orig, dest in result.move_log[:5]:
+                dest_name = Path(dest).name
+                self._add_result_item(ICON_CHECK, dest_name, "success", 1)
+            if len(result.move_log) > 5:
+                self._add_result_item("", f"... and {len(result.move_log) - 5} more files",
+                                      "secondary", 1)
 
-        if deleted_folders > 0:
-            self._append_result(f"Empty folders deleted: {deleted_folders}")
-
-        if backup_path:
-            self._append_result(f"\nBackup saved: {backup_path.name}")
-            self._append_result("Use 'Restore...' to undo this operation.")
-
-        # Show skipped details
         if all_skipped:
-            self._append_result("\n" + "-" * 55)
-            self._append_result("SKIPPED FILES:")
-
+            self._add_result_header(f"Skipped ({len(all_skipped)} files)", ICON_WARNING, "warning")
             by_reason = {}
             for sf in all_skipped:
                 if sf.reason not in by_reason:
-                    by_reason[sf.reason] = []
-                by_reason[sf.reason].append(sf)
+                    by_reason[sf.reason] = 0
+                by_reason[sf.reason] += 1
+            for reason, count in by_reason.items():
+                self._add_result_item(ICON_WARNING, f"{reason.value}: {count}", "warning", 1)
 
-            for reason, files in by_reason.items():
-                self._append_result(f"\n  {reason.value}: {len(files)}")
+        if result.errors > 0:
+            self._add_result_header(f"Errors ({result.errors})", ICON_ERROR, "danger")
+            for err in result.error_messages[:5]:
+                self._add_result_item(ICON_ERROR, err, "danger", 1)
 
-        if result.error_messages:
-            self._append_result("\n" + "-" * 55)
-            self._append_result("ERRORS:")
-            for error in result.error_messages[:10]:
-                self._append_result(f"  - {error}")
-            if len(result.error_messages) > 10:
-                self._append_result(f"  ... and {len(result.error_messages) - 10} more errors")
+        if backup_path:
+            self._add_result_header("Backup Created")
+            self._add_result_item(ICON_FILE, backup_path.name, "secondary", 1)
 
-        self.progress_var.set(100)
-        status = f"Complete! Moved {result.moved} files."
-        if result.cancelled:
-            status = f"Cancelled. Moved {result.moved} files before cancellation."
-        self.status_var.set(status)
+        if deleted_folders > 0:
+            self._add_result_header("Cleanup")
+            self._add_result_item(ICON_FOLDER, f"{deleted_folders} empty folders deleted", "secondary", 1)
+
+        self._set_progress(100)
+        self.status_var.set(f"Complete! Moved {result.moved} files.")
         self.planned_moves = []
         self.skipped_files = []
 
-        messagebox.showinfo(
-            "Organization Complete",
-            f"Files moved: {result.moved}\n"
-            f"Files skipped: {result.skipped + len(self.skipped_files)}\n"
-            f"Errors: {result.errors}"
-        )
-
     def _show_restore_dialog(self):
-        """Show dialog to select and restore from a backup."""
         backups = BackupManager.list_backups()
 
         if not backups:
-            messagebox.showinfo(
-                "No Backups",
-                "No backup files found.\n\nBackups are created automatically when you organize files."
-            )
+            messagebox.showinfo("No Backups", "No backup files found.\n\nBackups are created when you organize files.")
             return
 
-        dialog = tk.Toplevel(self.root)
+        if TTKBOOTSTRAP_AVAILABLE:
+            dialog = ttk.Toplevel(self.root)
+        else:
+            dialog = tk.Toplevel(self.root)
         dialog.title("Restore from Backup")
-        dialog.geometry("550x450")
-        dialog.configure(bg=ModernStyle.BG_DARK)
+        dialog.geometry("550x500")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1571,109 +1205,79 @@ class FileOrganizerApp:
         y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
         dialog.geometry(f"+{x}+{y}")
 
-        frame = ttk.Frame(dialog, padding="20")
+        frame = ttk.Frame(dialog, padding=24)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(
-            frame,
-            text="Restore from Backup",
-            style="Header.TLabel"
-        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(frame, text="Restore from Backup",
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
 
-        ttk.Label(
-            frame,
-            text="Select a backup to restore files to their original locations",
-            style="Subheader.TLabel"
-        ).pack(anchor="w", pady=(0, 16))
+        ttk.Label(frame, text="Select a backup to restore files to their original locations",
+                 font=("Segoe UI", 10), **self._bootstyle("secondary")).pack(anchor="w", pady=(4, 20))
 
-        list_frame = tk.Frame(frame, bg=ModernStyle.BG_MEDIUM, padx=2, pady=2)
-        list_frame.pack(fill="both", expand=True, pady=(0, 12))
+        # Listbox with treeview for better appearance
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True, pady=(0, 16))
 
-        listbox = tk.Listbox(
-            list_frame,
-            height=8,
-            font=("Segoe UI", 10),
-            bg=ModernStyle.BG_DARK,
-            fg=ModernStyle.TEXT_PRIMARY,
-            selectbackground=ModernStyle.PRIMARY,
-            selectforeground=ModernStyle.TEXT_PRIMARY,
-            relief="flat",
-            highlightthickness=0
-        )
-        listbox.pack(side="left", fill="both", expand=True)
+        columns = ("date", "files", "folder")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
+        tree.heading("date", text="Date")
+        tree.heading("files", text="Files")
+        tree.heading("folder", text="Source Folder")
+        tree.column("date", width=150)
+        tree.column("files", width=60)
+        tree.column("folder", width=300)
 
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        listbox.configure(yscrollcommand=scrollbar.set)
 
         for backup in backups:
-            display = f"  {backup.timestamp.strftime('%Y-%m-%d %H:%M:%S')}  |  {backup.file_count} files"
-            listbox.insert(tk.END, display)
-
-        details_var = tk.StringVar(value="Select a backup to see details")
-        details_label = ttk.Label(frame, textvariable=details_var, style="Status.TLabel", wraplength=500)
-        details_label.pack(anchor="w", pady=(0, 16))
-
-        def on_select(event):
-            selection = listbox.curselection()
-            if selection:
-                backup = backups[selection[0]]
-                details_var.set(f"Source: {backup.source_folder}")
-
-        listbox.bind('<<ListboxSelect>>', on_select)
+            tree.insert("", "end", values=(
+                backup.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                backup.file_count,
+                backup.source_folder
+            ))
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x")
 
         def do_restore():
-            selection = listbox.curselection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a backup to restore.", parent=dialog)
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select a backup.", parent=dialog)
                 return
-
-            backup = backups[selection[0]]
-
-            if not messagebox.askyesno(
-                "Confirm Restore",
-                f"This will restore {backup.file_count} files to their original locations.\n\nContinue?",
-                parent=dialog
-            ):
-                return
-
-            dialog.destroy()
-            self._execute_restore(backup)
+            idx = tree.index(sel[0])
+            backup = backups[idx]
+            if messagebox.askyesno("Confirm", f"Restore {backup.file_count} files?", parent=dialog):
+                dialog.destroy()
+                self._execute_restore(backup)
 
         def do_delete():
-            selection = listbox.curselection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a backup to delete.", parent=dialog)
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select a backup.", parent=dialog)
                 return
-
-            backup = backups[selection[0]]
-
-            if not messagebox.askyesno(
-                "Confirm Delete",
-                f"Delete backup from {backup.timestamp.strftime('%Y-%m-%d %H:%M:%S')}?\n\nThis cannot be undone.",
-                parent=dialog
-            ):
-                return
-
-            if BackupManager.delete_backup(backup.filepath):
-                listbox.delete(selection[0])
-                backups.pop(selection[0])
-                details_var.set("Backup deleted")
+            idx = tree.index(sel[0])
+            backup = backups[idx]
+            if messagebox.askyesno("Confirm Delete", "Delete this backup?", parent=dialog):
+                BackupManager.delete_backup(backup.filepath)
+                tree.delete(sel[0])
+                backups.pop(idx)
                 if not backups:
                     dialog.destroy()
-                    messagebox.showinfo("No Backups", "All backups have been deleted.")
 
-        ttk.Button(btn_frame, text="Restore Selected", command=do_restore, style="Accent.TButton").pack(side="left", padx=(0, 8))
-        ttk.Button(btn_frame, text="Delete", command=do_delete, style="Secondary.TButton").pack(side="left")
-        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        ttk.Button(btn_frame, text="Restore", command=do_restore,
+                  **self._bootstyle("success")).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="Delete", command=do_delete,
+                  **self._bootstyle("danger-outline")).pack(side="left")
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy,
+                  **self._bootstyle("secondary-link")).pack(side="right")
 
     def _execute_restore(self, backup_info: BackupInfo):
-        """Execute a restore operation."""
         self._clear_results()
-        self.progress_var.set(0)
+        self._set_progress(0)
         self.status_var.set("Loading backup...")
         self.is_processing = True
         self._update_button_states()
@@ -1689,11 +1293,9 @@ class FileOrganizerApp:
             messagebox.showerror("Error", f"Failed to load backup: {e}")
             return
 
-        self._append_result("RESTORING FROM BACKUP")
-        self._append_result("=" * 55)
-        self._append_result(f"\nBackup date: {backup_info.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-        self._append_result(f"Source folder: {backup_info.source_folder}")
-        self._append_result(f"Files to restore: {backup_info.file_count}\n")
+        self._add_result_header("Restoring from Backup")
+        self._add_result_item(ICON_CALENDAR, backup_info.timestamp.strftime('%Y-%m-%d %H:%M:%S'), "secondary", 1)
+        self._add_result_item(ICON_FILE, f"{backup_info.file_count} files to restore", "secondary", 1)
 
         cancel_flag = [False]
 
@@ -1702,75 +1304,43 @@ class FileOrganizerApp:
 
         def restore_progress(current, total, filename):
             percent = (current / total) * 100
-            self.progress_var.set(percent)
-            self.status_var.set(f"Restoring ({current}/{total}): {filename}")
+            self._set_progress(percent)
+            self.status_var.set(f"Restoring file {current} of {total}: {filename}")
             self.root.update_idletasks()
 
-        # Override cancel to set flag
         original_cancel = self._cancel_operation
+
         def cancel_restore():
             cancel_flag[0] = True
             self.status_var.set("Cancelling...")
+
         self._cancel_operation = cancel_restore
 
-        result = BackupManager.execute_restore(
-            backup_data,
-            progress_callback=restore_progress,
-            cancel_check=check_cancel
-        )
+        result = BackupManager.execute_restore(backup_data, restore_progress, check_cancel)
 
         self._cancel_operation = original_cancel
         self.is_processing = False
         self._update_button_states()
         self._show_cancel_button(False)
 
-        self._append_result("\nRESTORE COMPLETE")
-        self._append_result("=" * 55)
+        self._show_success_state(result.moved, result.skipped, result.errors)
 
-        if result.cancelled:
-            self._append_result("\n*** OPERATION WAS CANCELLED ***\n")
+        self._add_result_header(f"Restored ({result.moved} files)", ICON_CHECK, "success")
 
-        self._append_result(f"\nFiles restored: {result.moved}")
-        self._append_result(f"Files skipped: {result.skipped}")
-        self._append_result(f"Errors: {result.errors}")
+        if result.skipped > 0:
+            self._add_result_header(f"Skipped ({result.skipped})", ICON_WARNING, "warning")
 
-        if result.skipped_files:
-            self._append_result("\n" + "-" * 55)
-            self._append_result("SKIPPED FILES:")
-            for sf in result.skipped_files[:10]:
-                self._append_result(f"  - {sf.path.name}: {sf.reason.value}")
-            if len(result.skipped_files) > 10:
-                self._append_result(f"  ... and {len(result.skipped_files) - 10} more")
+        if result.errors > 0:
+            self._add_result_header(f"Errors ({result.errors})", ICON_ERROR, "danger")
 
-        if result.error_messages:
-            self._append_result("\n" + "-" * 55)
-            self._append_result("ERRORS:")
-            for error in result.error_messages[:10]:
-                self._append_result(f"  - {error}")
-
-        self.progress_var.set(100)
-        status = f"Restore complete! {result.moved} files restored."
-        if result.cancelled:
-            status = f"Cancelled. Restored {result.moved} files before cancellation."
-        self.status_var.set(status)
+        self._set_progress(100)
+        self.status_var.set(f"Restore complete! {result.moved} files restored.")
 
         if result.moved > 0 and result.errors == 0 and not result.cancelled:
-            if messagebox.askyesno(
-                "Restore Complete",
-                f"Successfully restored {result.moved} files.\n\nDelete this backup file?"
-            ):
+            if messagebox.askyesno("Success", f"Restored {result.moved} files.\n\nDelete backup?"):
                 BackupManager.delete_backup(backup_info.filepath)
-                self._append_result("\nBackup file deleted.")
-        else:
-            messagebox.showinfo(
-                "Restore Complete",
-                f"Restored {result.moved} files.\n"
-                f"Skipped: {result.skipped}\n"
-                f"Errors: {result.errors}"
-            )
 
     def run(self):
-        """Start the application."""
         self.root.mainloop()
 
 
