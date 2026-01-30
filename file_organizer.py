@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from enum import Enum
 import ctypes
+import threading
+import queue
+import time
 
 try:
     import ttkbootstrap as ttk
@@ -34,7 +37,7 @@ BACKUP_DIR = Path(__file__).parent / "backups"
 
 # Application info
 APP_NAME = "Folder Organizer"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # Windows path length limit
 MAX_PATH_LENGTH = 260
@@ -382,7 +385,8 @@ class FileOrganizer:
                             return True
         return False
 
-    def check_file_accessibility(self, file_path: Path) -> Optional[SkipReason]:
+    def check_file_accessibility(self, file_path: Path, check_lock: bool = True) -> Optional[SkipReason]:
+        """Check if file can be accessed. Set check_lock=False for faster scanning."""
         try:
             if not self.options.include_symlinks and is_symlink_or_shortcut(file_path):
                 return SkipReason.SYMLINK
@@ -390,7 +394,8 @@ class FileOrganizer:
                 return SkipReason.HIDDEN_FILE
             if is_system_file(file_path):
                 return SkipReason.SYSTEM_FILE
-            if is_file_locked(file_path):
+            # Only check lock when actually moving (expensive operation)
+            if check_lock and is_file_locked(file_path):
                 return SkipReason.FILE_IN_USE
         except PermissionError:
             return SkipReason.PERMISSION_DENIED
@@ -398,22 +403,50 @@ class FileOrganizer:
             return SkipReason.PERMISSION_DENIED
         return None
 
-    def scan_files(self, progress_callback: Callable[[str], None] = None) -> tuple[list[FileMove], list[SkippedFile]]:
+    def _scan_directory_fast(self, directory: Path):
+        """Fast recursive directory scan using os.scandir."""
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if self._cancel_requested:
+                        return
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            yield Path(entry.path)
+                        elif entry.is_dir(follow_symlinks=False):
+                            yield from self._scan_directory_fast(Path(entry.path))
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
+            pass
+
+    def scan_files(self, progress_callback: Callable[[str, int], None] = None) -> tuple[list[FileMove], list[SkippedFile]]:
+        """Scan files with optimized performance. Callback receives (status_msg, file_count)."""
         planned_moves = []
         skipped_files = []
         self.reset_cancel()
 
-        for file_path in self.source_folder.rglob('*'):
+        file_count = 0
+        last_update = time.time()
+        update_interval = 0.1  # Update UI every 100ms max
+
+        for file_path in self._scan_directory_fast(self.source_folder):
             if self._cancel_requested:
                 break
-            if not file_path.is_file():
-                continue
+
+            file_count += 1
+
+            # Batch UI updates for performance
+            now = time.time()
+            if progress_callback and (now - last_update) >= update_interval:
+                progress_callback(f"Scanning: {file_count} files found...", file_count)
+                last_update = now
+
             if self.is_in_organized_structure(file_path):
                 continue
-            if progress_callback:
-                progress_callback(f"Scanning: {file_path.name}")
 
-            skip_reason = self.check_file_accessibility(file_path)
+            # Skip lock check during scan for speed - will check before move
+            skip_reason = self.check_file_accessibility(file_path, check_lock=False)
             if skip_reason:
                 skipped_files.append(SkippedFile(file_path, skip_reason))
                 continue
@@ -439,24 +472,36 @@ class FileOrganizer:
                 month=file_date.month if file_date else 0
             ))
 
+        # Final update
+        if progress_callback:
+            progress_callback(f"Scan complete: {file_count} files processed", file_count)
+
         return planned_moves, skipped_files
 
     def execute_moves(self, planned_moves: list[FileMove],
                       progress_callback: Callable[[int, int, str], None] = None) -> OrganizeResult:
+        """Execute file moves with batched progress updates."""
         result = OrganizeResult()
         total = len(planned_moves)
         self.reset_cancel()
+
+        last_update = time.time()
+        update_interval = 0.05  # Update UI every 50ms max for moves
 
         for i, move in enumerate(planned_moves):
             if self._cancel_requested:
                 result.cancelled = True
                 break
 
-            if progress_callback:
+            # Batch UI updates
+            now = time.time()
+            if progress_callback and (now - last_update) >= update_interval:
                 progress_callback(i + 1, total, move.source.name)
+                last_update = now
 
             try:
-                skip_reason = self.check_file_accessibility(move.source)
+                # Full accessibility check including lock check before move
+                skip_reason = self.check_file_accessibility(move.source, check_lock=True)
                 if skip_reason:
                     result.skipped += 1
                     result.skipped_files.append(SkippedFile(move.source, skip_reason))
@@ -488,6 +533,10 @@ class FileOrganizer:
             except Exception as e:
                 result.errors += 1
                 result.error_messages.append(f"{move.source.name}: {str(e)}")
+
+        # Final progress update
+        if progress_callback:
+            progress_callback(total, total, "Complete")
 
         return result
 
@@ -629,8 +678,15 @@ class FileOrganizerApp:
         self.is_processing = False
         self.file_count = 0
 
+        # Threading support
+        self._task_queue = queue.Queue()
+        self._worker_thread: Optional[threading.Thread] = None
+
         self._create_widgets()
         self._center_window()
+
+        # Start polling for task results
+        self._poll_task_queue()
 
     def _center_window(self):
         self.root.update_idletasks()
@@ -638,6 +694,34 @@ class FileOrganizerApp:
         x = (self.root.winfo_screenwidth() // 2) - (w // 2)
         y = (self.root.winfo_screenheight() // 2) - (h // 2)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _poll_task_queue(self):
+        """Poll the task queue for updates from worker thread."""
+        try:
+            while True:
+                task = self._task_queue.get_nowait()
+                task_type = task.get("type")
+
+                if task_type == "status":
+                    self.status_var.set(task["message"])
+                elif task_type == "progress":
+                    self._set_progress(task["percent"])
+                    if "message" in task:
+                        self.status_var.set(task["message"])
+                elif task_type == "scan_complete":
+                    self._on_scan_complete(task["moves"], task["skipped"], task["cancelled"])
+                elif task_type == "organize_complete":
+                    self._on_organize_complete(task["result"], task["all_skipped"], task["backup_path"])
+        except queue.Empty:
+            pass
+
+        # Continue polling
+        self.root.after(50, self._poll_task_queue)
+
+    def _run_in_thread(self, target, *args):
+        """Run a function in a background thread."""
+        self._worker_thread = threading.Thread(target=target, args=args, daemon=True)
+        self._worker_thread.start()
 
     def _create_widgets(self):
         # Main container with padding
@@ -977,23 +1061,38 @@ class FileOrganizerApp:
         self.is_processing = True
         self._update_button_states()
         self._show_cancel_button(True)
-        self.root.update_idletasks()
 
         sort_mode = self._get_sort_mode()
         options = self._get_scan_options()
         self.organizer = FileOrganizer(folder, sort_mode, options)
 
-        def scan_progress(msg):
-            self.status_var.set(msg)
-            self.root.update_idletasks()
+        # Run scan in background thread
+        self._run_in_thread(self._scan_worker, folder, sort_mode, options)
 
-        self.planned_moves, self.skipped_files = self.organizer.scan_files(progress_callback=scan_progress)
+    def _scan_worker(self, folder: str, sort_mode: SortMode, options: ScanOptions):
+        """Background worker for scanning files."""
+        def progress_callback(msg: str, count: int):
+            self._task_queue.put({"type": "status", "message": msg})
 
+        moves, skipped = self.organizer.scan_files(progress_callback=progress_callback)
+        cancelled = self.organizer._cancel_requested
+
+        self._task_queue.put({
+            "type": "scan_complete",
+            "moves": moves,
+            "skipped": skipped,
+            "cancelled": cancelled
+        })
+
+    def _on_scan_complete(self, moves: list, skipped: list, cancelled: bool):
+        """Called on main thread when scan completes."""
+        self.planned_moves = moves
+        self.skipped_files = skipped
         self.is_processing = False
         self._update_button_states()
         self._show_cancel_button(False)
 
-        if self.organizer._cancel_requested:
+        if cancelled:
             self.status_var.set("Preview cancelled.")
             self._add_result_header("Preview was cancelled", ICON_WARNING, "warning")
             return
@@ -1018,6 +1117,9 @@ class FileOrganizerApp:
         self.results_summary.configure(
             text=f"{len(self.planned_moves)} to move, {len(self.skipped_files)} skipped"
         )
+
+        sort_mode = self._get_sort_mode()
+        folder = self.selected_folder.get()
 
         # Show folder structure preview
         if self.planned_moves:
@@ -1084,6 +1186,7 @@ class FileOrganizerApp:
         options = self._get_scan_options()
 
         if not self.planned_moves:
+            # Quick synchronous scan if no preview was done
             self.organizer = FileOrganizer(folder, sort_mode, options)
             self.planned_moves, self.skipped_files = self.organizer.scan_files()
 
@@ -1110,11 +1213,18 @@ class FileOrganizerApp:
 
         self.organizer = FileOrganizer(folder, sort_mode, options)
 
+        # Run organize in background thread
+        self._run_in_thread(self._organize_worker, folder, sort_mode, options)
+
+    def _organize_worker(self, folder: str, sort_mode: SortMode, options: ScanOptions):
+        """Background worker for organizing files."""
         def move_progress(current, total, filename):
             percent = (current / total) * 100
-            self._set_progress(percent)
-            self.status_var.set(f"Moving file {current} of {total}: {filename}")
-            self.root.update_idletasks()
+            self._task_queue.put({
+                "type": "progress",
+                "percent": percent,
+                "message": f"Moving file {current} of {total}: {filename}"
+            })
 
         result = self.organizer.execute_moves(self.planned_moves, progress_callback=move_progress)
         all_skipped = self.skipped_files + result.skipped_files
@@ -1125,12 +1235,19 @@ class FileOrganizerApp:
             backup_path = BackupManager.save_backup(folder, result.move_log, sort_mode.value, all_skipped)
 
         # Delete empty folders
-        deleted_folders = 0
         if options.delete_empty_folders and result.moved > 0:
-            self.status_var.set("Cleaning up empty folders...")
-            self.root.update_idletasks()
-            deleted_folders = delete_empty_folders(Path(folder))
+            self._task_queue.put({"type": "status", "message": "Cleaning up empty folders..."})
+            delete_empty_folders(Path(folder))
 
+        self._task_queue.put({
+            "type": "organize_complete",
+            "result": result,
+            "all_skipped": all_skipped,
+            "backup_path": backup_path
+        })
+
+    def _on_organize_complete(self, result: OrganizeResult, all_skipped: list, backup_path: Optional[Path]):
+        """Called on main thread when organize completes."""
         self.is_processing = False
         self._update_button_states()
         self._show_cancel_button(False)
@@ -1174,10 +1291,6 @@ class FileOrganizerApp:
         if backup_path:
             self._add_result_header("Backup Created")
             self._add_result_item(ICON_FILE, backup_path.name, "secondary", 1)
-
-        if deleted_folders > 0:
-            self._add_result_header("Cleanup")
-            self._add_result_item(ICON_FOLDER, f"{deleted_folders} empty folders deleted", "secondary", 1)
 
         self._set_progress(100)
         self.status_var.set(f"Complete! Moved {result.moved} files.")
