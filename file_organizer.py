@@ -37,7 +37,7 @@ BACKUP_DIR = Path(__file__).parent / "backups"
 
 # Application info
 APP_NAME = "Folder Organizer"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # Windows path length limit
 MAX_PATH_LENGTH = 260
@@ -159,10 +159,13 @@ class OrganizeResult:
     moved: int = 0
     skipped: int = 0
     errors: int = 0
+    folders_moved: int = 0
     error_messages: list = field(default_factory=list)
     skipped_files: list = field(default_factory=list)
     move_log: list = field(default_factory=list)
+    folder_move_log: list = field(default_factory=list)
     cancelled: bool = False
+    folders_detected: bool = False  # True if folders were found in source
 
 
 @dataclass
@@ -180,6 +183,18 @@ class ScanOptions:
     include_hidden: bool = False
     include_symlinks: bool = False
     delete_empty_folders: bool = False
+    preserve_folders: bool = False  # Move folders as units (only works with By Date)
+    flatten_folders: bool = False   # Ignore folder structure, sort all files
+
+
+@dataclass
+class FolderMove:
+    """Represents a planned folder move operation."""
+    source: Path
+    destination: Path
+    year: int
+    month: int
+    file_count: int  # Number of files in the folder
 
 
 def is_hidden_file(file_path: Path) -> bool:
@@ -403,8 +418,8 @@ class FileOrganizer:
             return SkipReason.PERMISSION_DENIED
         return None
 
-    def _scan_directory_fast(self, directory: Path):
-        """Fast recursive directory scan using os.scandir."""
+    def _scan_directory_fast(self, directory: Path, recursive: bool = True):
+        """Fast directory scan using os.scandir. Set recursive=False for root only."""
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
@@ -413,24 +428,156 @@ class FileOrganizer:
                     try:
                         if entry.is_file(follow_symlinks=False):
                             yield Path(entry.path)
-                        elif entry.is_dir(follow_symlinks=False):
-                            yield from self._scan_directory_fast(Path(entry.path))
+                        elif entry.is_dir(follow_symlinks=False) and recursive:
+                            yield from self._scan_directory_fast(Path(entry.path), recursive=True)
                     except (PermissionError, OSError):
                         continue
         except (PermissionError, OSError):
             pass
 
-    def scan_files(self, progress_callback: Callable[[str, int], None] = None) -> tuple[list[FileMove], list[SkippedFile]]:
-        """Scan files with optimized performance. Callback receives (status_msg, file_count)."""
+    def _get_root_folders(self) -> list[Path]:
+        """Get immediate subdirectories of the source folder."""
+        folders = []
+        try:
+            with os.scandir(self.source_folder) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            folder_path = Path(entry.path)
+                            # Skip if it looks like an organized folder
+                            if not self._is_organized_folder(folder_path):
+                                folders.append(folder_path)
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
+            pass
+        return folders
+
+    def _is_organized_folder(self, folder_path: Path) -> bool:
+        """Check if a folder is part of the organized structure."""
+        name = folder_path.name
+        valid_categories = set(EXTENSION_CATEGORIES.values()) | {'Other', 'No Extension'}
+
+        # Check if it's a category folder
+        if name in valid_categories:
+            return True
+        # Check if it's a year folder
+        if name.isdigit() and len(name) == 4:
+            return True
+        # Check if it's a month folder
+        if name in MONTH_NAMES.values() or name == "Unknown":
+            return True
+        return False
+
+    def _count_files_in_folder(self, folder_path: Path) -> int:
+        """Count all files recursively in a folder."""
+        count = 0
+        try:
+            for _ in self._scan_directory_fast(folder_path, recursive=True):
+                count += 1
+        except Exception:
+            pass
+        return count
+
+    def get_folder_destination(self, folder_path: Path, folder_date: Optional[datetime] = None) -> Path:
+        """Get destination path for a folder (only By Date mode)."""
+        if folder_date:
+            year = str(folder_date.year)
+            month = MONTH_NAMES[folder_date.month]
+        else:
+            year = "Unknown"
+            month = "Unknown"
+        return self.source_folder / year / month / folder_path.name
+
+    def get_folder_date(self, folder_path: Path) -> tuple[datetime, bool]:
+        """Get the date of a folder (oldest file or folder creation date)."""
+        try:
+            # Use folder's own date
+            stat_info = folder_path.stat()
+            ctime = stat_info.st_ctime
+            mtime = stat_info.st_mtime
+            timestamp = min(ctime, mtime)
+            dt = datetime.fromtimestamp(timestamp)
+            if dt.year < 1980 or dt.year > datetime.now().year + 1:
+                return (None, False)
+            return (dt, True)
+        except (OSError, ValueError, OverflowError):
+            return (None, False)
+
+    def scan_files(self, progress_callback: Callable[[str, int], None] = None) -> tuple[list[FileMove], list[SkippedFile], list[FolderMove], bool]:
+        """
+        Scan files with optimized performance.
+
+        Returns: (planned_moves, skipped_files, planned_folder_moves, folders_detected)
+        """
         planned_moves = []
         skipped_files = []
+        planned_folder_moves = []
         self.reset_cancel()
 
         file_count = 0
         last_update = time.time()
         update_interval = 0.1  # Update UI every 100ms max
 
-        for file_path in self._scan_directory_fast(self.source_folder):
+        # Check for folders in root directory
+        root_folders = self._get_root_folders()
+        folders_detected = len(root_folders) > 0
+
+        # Determine scanning strategy based on options
+        if self.options.flatten_folders:
+            # Flatten mode: scan all files recursively (ignore folder structure)
+            scan_recursive = True
+            process_folders = False
+        elif self.options.preserve_folders and self.sort_mode == SortMode.BY_DATE:
+            # Preserve folders mode with By Date: move folders as units
+            scan_recursive = False  # Only scan root files
+            process_folders = True
+        elif folders_detected and self.sort_mode != SortMode.BY_DATE:
+            # Type modes with folders: only process root files
+            scan_recursive = False
+            process_folders = False
+        else:
+            # Default: scan recursively
+            scan_recursive = True
+            process_folders = False
+
+        # Process folders if preserve_folders is enabled and mode is BY_DATE
+        if process_folders and root_folders:
+            if progress_callback:
+                progress_callback(f"Scanning folders...", 0)
+
+            for folder_path in root_folders:
+                if self._cancel_requested:
+                    break
+
+                folder_date, _ = self.get_folder_date(folder_path)
+                dest_path = self.get_folder_destination(folder_path, folder_date)
+
+                # Skip if already in correct location
+                if folder_path.resolve() == dest_path.resolve():
+                    continue
+
+                # Check path length
+                if not self.check_path_length(dest_path):
+                    continue
+
+                file_count_in_folder = self._count_files_in_folder(folder_path)
+
+                planned_folder_moves.append(FolderMove(
+                    source=folder_path,
+                    destination=dest_path,
+                    year=folder_date.year if folder_date else 0,
+                    month=folder_date.month if folder_date else 0,
+                    file_count=file_count_in_folder
+                ))
+
+        # Scan files
+        if scan_recursive:
+            file_iterator = self._scan_directory_fast(self.source_folder, recursive=True)
+        else:
+            file_iterator = self._scan_directory_fast(self.source_folder, recursive=False)
+
+        for file_path in file_iterator:
             if self._cancel_requested:
                 break
 
@@ -476,27 +623,79 @@ class FileOrganizer:
         if progress_callback:
             progress_callback(f"Scan complete: {file_count} files processed", file_count)
 
-        return planned_moves, skipped_files
+        return planned_moves, skipped_files, planned_folder_moves, folders_detected
 
     def execute_moves(self, planned_moves: list[FileMove],
+                      planned_folder_moves: list[FolderMove] = None,
                       progress_callback: Callable[[int, int, str], None] = None) -> OrganizeResult:
-        """Execute file moves with batched progress updates."""
+        """Execute file and folder moves with batched progress updates."""
         result = OrganizeResult()
-        total = len(planned_moves)
+        planned_folder_moves = planned_folder_moves or []
+
+        total_files = len(planned_moves)
+        total_folders = len(planned_folder_moves)
+        total = total_files + total_folders
+        current = 0
+
         self.reset_cancel()
 
         last_update = time.time()
         update_interval = 0.05  # Update UI every 50ms max for moves
 
-        for i, move in enumerate(planned_moves):
+        # First, move folders
+        for folder_move in planned_folder_moves:
             if self._cancel_requested:
                 result.cancelled = True
                 break
 
+            current += 1
+
             # Batch UI updates
             now = time.time()
             if progress_callback and (now - last_update) >= update_interval:
-                progress_callback(i + 1, total, move.source.name)
+                progress_callback(current, total, f"Moving folder: {folder_move.source.name}")
+                last_update = now
+
+            try:
+                folder_move.destination.parent.mkdir(parents=True, exist_ok=True)
+
+                # Handle duplicate folder names
+                final_dest = folder_move.destination
+                if final_dest.exists():
+                    counter = 1
+                    while final_dest.exists():
+                        final_dest = folder_move.destination.parent / f"{folder_move.source.name}_{counter}"
+                        counter += 1
+                        if counter > 10000:
+                            raise RuntimeError("Too many duplicate folders")
+
+                original_path = str(folder_move.source.resolve())
+                shutil.move(str(folder_move.source), str(final_dest))
+                result.folders_moved += 1
+                result.folder_move_log.append((original_path, str(final_dest.resolve()), folder_move.file_count))
+
+            except PermissionError as e:
+                result.errors += 1
+                result.error_messages.append(f"Folder {folder_move.source.name}: {str(e)}")
+            except OSError as e:
+                result.errors += 1
+                result.error_messages.append(f"Folder {folder_move.source.name}: {str(e)}")
+            except Exception as e:
+                result.errors += 1
+                result.error_messages.append(f"Folder {folder_move.source.name}: {str(e)}")
+
+        # Then, move files
+        for move in planned_moves:
+            if self._cancel_requested:
+                result.cancelled = True
+                break
+
+            current += 1
+
+            # Batch UI updates
+            now = time.time()
+            if progress_callback and (now - last_update) >= update_interval:
+                progress_callback(current, total, move.source.name)
                 last_update = now
 
             try:
@@ -671,9 +870,13 @@ class FileOrganizerApp:
         self.include_hidden = tk.BooleanVar(value=False)
         self.include_symlinks = tk.BooleanVar(value=False)
         self.delete_empty = tk.BooleanVar(value=False)
+        self.preserve_folders = tk.BooleanVar(value=False)
+        self.flatten_folders = tk.BooleanVar(value=False)
 
         self.planned_moves: list[FileMove] = []
+        self.planned_folder_moves: list[FolderMove] = []
         self.skipped_files: list[SkippedFile] = []
+        self.folders_detected = False
         self.organizer: Optional[FileOrganizer] = None
         self.is_processing = False
         self.file_count = 0
@@ -709,7 +912,8 @@ class FileOrganizerApp:
                     if "message" in task:
                         self.status_var.set(task["message"])
                 elif task_type == "scan_complete":
-                    self._on_scan_complete(task["moves"], task["skipped"], task["cancelled"])
+                    self._on_scan_complete(task["moves"], task["skipped"], task["folder_moves"],
+                                          task["folders_detected"], task["cancelled"])
                 elif task_type == "organize_complete":
                     self._on_organize_complete(task["result"], task["all_skipped"], task["backup_path"])
         except queue.Empty:
@@ -805,7 +1009,7 @@ class FileOrganizerApp:
         options_frame = ttk.Frame(card)
         options_frame.pack(fill="x")
 
-        # Row 1
+        # Row 1 - File options
         row1 = ttk.Frame(options_frame)
         row1.pack(fill="x", pady=4)
 
@@ -818,14 +1022,38 @@ class FileOrganizerApp:
                                      **self._bootstyle("round-toggle"))
         cb_symlinks.pack(side="left")
 
-        # Row 2
+        # Row 2 - Folder options
         row2 = ttk.Frame(options_frame)
         row2.pack(fill="x", pady=4)
 
-        cb_empty = ttk.Checkbutton(row2, text="Delete empty folders after organizing",
+        self.cb_preserve = ttk.Checkbutton(row2, text="Preserve folders (move as units, By Date only)",
+                                           variable=self.preserve_folders,
+                                           command=self._on_folder_option_changed,
+                                           **self._bootstyle("round-toggle"))
+        self.cb_preserve.pack(side="left", padx=(0, 40))
+
+        self.cb_flatten = ttk.Checkbutton(row2, text="Flatten all files (ignore folder structure)",
+                                          variable=self.flatten_folders,
+                                          command=self._on_folder_option_changed,
+                                          **self._bootstyle("round-toggle"))
+        self.cb_flatten.pack(side="left")
+
+        # Row 3 - Cleanup option
+        row3 = ttk.Frame(options_frame)
+        row3.pack(fill="x", pady=4)
+
+        cb_empty = ttk.Checkbutton(row3, text="Delete empty folders after organizing",
                                   variable=self.delete_empty,
                                   **self._bootstyle("round-toggle"))
         cb_empty.pack(side="left")
+
+    def _on_folder_option_changed(self):
+        """Handle mutual exclusivity of folder options."""
+        # Preserve and flatten are mutually exclusive
+        if self.preserve_folders.get() and self.flatten_folders.get():
+            # Last one clicked wins - disable the other
+            # We can't tell which was clicked, so just disable flatten if preserve is on
+            pass  # Let them both be on, scan_files will handle priority
 
     def _create_action_buttons(self):
         btn_frame = ttk.Frame(self.main_frame)
@@ -1046,7 +1274,9 @@ class FileOrganizerApp:
         return ScanOptions(
             include_hidden=self.include_hidden.get(),
             include_symlinks=self.include_symlinks.get(),
-            delete_empty_folders=self.delete_empty.get()
+            delete_empty_folders=self.delete_empty.get(),
+            preserve_folders=self.preserve_folders.get(),
+            flatten_folders=self.flatten_folders.get()
         )
 
     def _preview(self):
@@ -1074,20 +1304,24 @@ class FileOrganizerApp:
         def progress_callback(msg: str, count: int):
             self._task_queue.put({"type": "status", "message": msg})
 
-        moves, skipped = self.organizer.scan_files(progress_callback=progress_callback)
+        moves, skipped, folder_moves, folders_detected = self.organizer.scan_files(progress_callback=progress_callback)
         cancelled = self.organizer._cancel_requested
 
         self._task_queue.put({
             "type": "scan_complete",
             "moves": moves,
             "skipped": skipped,
+            "folder_moves": folder_moves,
+            "folders_detected": folders_detected,
             "cancelled": cancelled
         })
 
-    def _on_scan_complete(self, moves: list, skipped: list, cancelled: bool):
+    def _on_scan_complete(self, moves: list, skipped: list, folder_moves: list, folders_detected: bool, cancelled: bool):
         """Called on main thread when scan completes."""
         self.planned_moves = moves
+        self.planned_folder_moves = folder_moves
         self.skipped_files = skipped
+        self.folders_detected = folders_detected
         self.is_processing = False
         self._update_button_states()
         self._show_cancel_button(False)
@@ -1107,16 +1341,36 @@ class FileOrganizerApp:
                                  **self._bootstyle("info"))
         dry_run_label.pack(pady=8)
 
-        if not self.planned_moves and not self.skipped_files:
+        sort_mode = self._get_sort_mode()
+        options = self._get_scan_options()
+
+        # Show folder detection warning for Type modes
+        if folders_detected and sort_mode != SortMode.BY_DATE and not options.flatten_folders:
+            warning_frame = ttk.Frame(self.results_inner)
+            warning_frame.pack(fill="x", pady=(0, 12))
+            warning_label = ttk.Label(warning_frame,
+                                     text=f"{ICON_WARNING}  Folders detected - only root files will be sorted. "
+                                          f"Enable 'Flatten all files' to sort all files, or use 'By Date' mode with 'Preserve folders'.",
+                                     font=("Segoe UI", 9),
+                                     wraplength=700,
+                                     **self._bootstyle("warning"))
+            warning_label.pack(pady=8)
+
+        if not self.planned_moves and not self.planned_folder_moves and not self.skipped_files:
             self.status_var.set("No files need to be organized.")
             self._add_result_header("No files to organize", ICON_CHECK, "success")
             self._add_result_item("", "All files are already in the correct location", "secondary", 1)
             return
 
         # Summary
-        self.results_summary.configure(
-            text=f"{len(self.planned_moves)} to move, {len(self.skipped_files)} skipped"
-        )
+        summary_parts = []
+        if self.planned_moves:
+            summary_parts.append(f"{len(self.planned_moves)} files")
+        if self.planned_folder_moves:
+            summary_parts.append(f"{len(self.planned_folder_moves)} folders")
+        if self.skipped_files:
+            summary_parts.append(f"{len(self.skipped_files)} skipped")
+        self.results_summary.configure(text=", ".join(summary_parts))
 
         sort_mode = self._get_sort_mode()
         folder = self.selected_folder.get()
@@ -1159,6 +1413,19 @@ class FileOrganizerApp:
                         for month in sorted(year_data["months"]):
                             self._add_tree_item(f"{ICON_FOLDER} {month}/", 3)
 
+        # Show folder moves preview
+        if self.planned_folder_moves:
+            total_files_in_folders = sum(fm.file_count for fm in self.planned_folder_moves)
+            self._add_result_header(f"Folders to Move ({len(self.planned_folder_moves)} folders, {total_files_in_folders} files)")
+
+            for fm in self.planned_folder_moves[:10]:
+                year = str(fm.year) if fm.year else "Unknown"
+                month = MONTH_NAMES.get(fm.month, "Unknown") if fm.month else "Unknown"
+                self._add_result_item(ICON_FOLDER, f"{fm.source.name}/ -> {year}/{month}/ ({fm.file_count} files)",
+                                      "secondary", 1)
+            if len(self.planned_folder_moves) > 10:
+                self._add_result_item("", f"... and {len(self.planned_folder_moves) - 10} more folders", "secondary", 1)
+
         # Show skipped files
         if self.skipped_files:
             self._add_result_header(f"Skipped Files ({len(self.skipped_files)})", ICON_WARNING, "warning")
@@ -1174,7 +1441,12 @@ class FileOrganizerApp:
                                       "warning", 1)
 
         self._set_progress(100)
-        self.status_var.set(f"Preview complete. {len(self.planned_moves)} files ready to organize.")
+        status_parts = []
+        if self.planned_moves:
+            status_parts.append(f"{len(self.planned_moves)} files")
+        if self.planned_folder_moves:
+            status_parts.append(f"{len(self.planned_folder_moves)} folders")
+        self.status_var.set(f"Preview complete. {' and '.join(status_parts)} ready to organize.")
 
     def _organize(self):
         folder = self.selected_folder.get()
@@ -1185,17 +1457,22 @@ class FileOrganizerApp:
         sort_mode = self._get_sort_mode()
         options = self._get_scan_options()
 
-        if not self.planned_moves:
+        if not self.planned_moves and not self.planned_folder_moves:
             # Quick synchronous scan if no preview was done
             self.organizer = FileOrganizer(folder, sort_mode, options)
-            self.planned_moves, self.skipped_files = self.organizer.scan_files()
+            self.planned_moves, self.skipped_files, self.planned_folder_moves, self.folders_detected = self.organizer.scan_files()
 
-            if not self.planned_moves:
-                messagebox.showinfo("Nothing to Do", "No files need to be organized.")
+            if not self.planned_moves and not self.planned_folder_moves:
+                messagebox.showinfo("Nothing to Do", "No files or folders need to be organized.")
                 return
 
         # Confirmation dialog
-        msg = f"This will organize {len(self.planned_moves)} files."
+        msg_parts = []
+        if self.planned_moves:
+            msg_parts.append(f"{len(self.planned_moves)} files")
+        if self.planned_folder_moves:
+            msg_parts.append(f"{len(self.planned_folder_moves)} folders")
+        msg = f"This will organize {' and '.join(msg_parts)}."
         if self.skipped_files:
             msg += f"\n{len(self.skipped_files)} files will be skipped."
         if options.delete_empty_folders:
@@ -1218,24 +1495,30 @@ class FileOrganizerApp:
 
     def _organize_worker(self, folder: str, sort_mode: SortMode, options: ScanOptions):
         """Background worker for organizing files."""
-        def move_progress(current, total, filename):
-            percent = (current / total) * 100
+        total_items = len(self.planned_moves) + len(self.planned_folder_moves)
+
+        def move_progress(current, total, name):
+            percent = (current / total) * 100 if total > 0 else 100
             self._task_queue.put({
                 "type": "progress",
                 "percent": percent,
-                "message": f"Moving file {current} of {total}: {filename}"
+                "message": f"Moving {current} of {total}: {name}"
             })
 
-        result = self.organizer.execute_moves(self.planned_moves, progress_callback=move_progress)
+        result = self.organizer.execute_moves(
+            self.planned_moves,
+            self.planned_folder_moves,
+            progress_callback=move_progress
+        )
         all_skipped = self.skipped_files + result.skipped_files
 
         # Save backup
         backup_path = None
-        if result.move_log:
+        if result.move_log or result.folder_move_log:
             backup_path = BackupManager.save_backup(folder, result.move_log, sort_mode.value, all_skipped)
 
         # Delete empty folders
-        if options.delete_empty_folders and result.moved > 0:
+        if options.delete_empty_folders and (result.moved > 0 or result.folders_moved > 0):
             self._task_queue.put({"type": "status", "message": "Cleaning up empty folders..."})
             delete_empty_folders(Path(folder))
 
@@ -1252,19 +1535,36 @@ class FileOrganizerApp:
         self._update_button_states()
         self._show_cancel_button(False)
 
+        total_moved = result.moved + result.folders_moved
+
         # Show success/error state
-        self._show_success_state(result.moved, len(all_skipped), result.errors)
+        self._show_success_state(total_moved, len(all_skipped), result.errors)
 
         # Update summary
-        self.results_summary.configure(
-            text=f"{result.moved} moved, {len(all_skipped)} skipped, {result.errors} errors"
-        )
+        summary_parts = []
+        if result.moved:
+            summary_parts.append(f"{result.moved} files")
+        if result.folders_moved:
+            summary_parts.append(f"{result.folders_moved} folders")
+        summary_parts.append(f"{len(all_skipped)} skipped")
+        summary_parts.append(f"{result.errors} errors")
+        self.results_summary.configure(text=", ".join(summary_parts))
 
         # Results details
         if result.cancelled:
             self._add_result_header("Operation Cancelled", ICON_WARNING, "warning")
 
-        self._add_result_header(f"Moved ({result.moved} files)", ICON_CHECK, "success")
+        # Show moved folders
+        if result.folders_moved > 0:
+            self._add_result_header(f"Moved Folders ({result.folders_moved})", ICON_CHECK, "success")
+            for orig, dest, file_count in result.folder_move_log[:5]:
+                folder_name = Path(dest).name
+                self._add_result_item(ICON_FOLDER, f"{folder_name}/ ({file_count} files)", "success", 1)
+            if len(result.folder_move_log) > 5:
+                self._add_result_item("", f"... and {len(result.folder_move_log) - 5} more folders", "secondary", 1)
+
+        # Show moved files
+        self._add_result_header(f"Moved Files ({result.moved})", ICON_CHECK, "success")
         if result.move_log:
             for orig, dest in result.move_log[:5]:
                 dest_name = Path(dest).name
