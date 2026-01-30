@@ -19,6 +19,7 @@ import ctypes
 import threading
 import queue
 import time
+import math
 
 try:
     import ttkbootstrap as ttk
@@ -37,7 +38,7 @@ BACKUP_DIR = Path(__file__).parent / "backups"
 
 # Application info
 APP_NAME = "Folder Organizer"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 # Windows path length limit
 MAX_PATH_LENGTH = 260
@@ -56,6 +57,20 @@ ICON_WARNING = "\u26A0"
 ICON_ERROR = "\u2717"
 ICON_ARROW = "\u2192"
 ICON_FILE = "\U0001F4C4"
+
+# Pie chart colors (colorblind-friendly palette)
+PIE_COLORS = [
+    "#4E79A7",  # Blue
+    "#F28E2B",  # Orange
+    "#E15759",  # Red
+    "#76B7B2",  # Teal
+    "#59A14F",  # Green
+    "#EDC948",  # Yellow
+    "#B07AA1",  # Purple
+    "#FF9DA7",  # Pink
+    "#9C755F",  # Brown
+    "#BAB0AC",  # Gray
+]
 
 
 class SortMode(Enum):
@@ -938,6 +953,7 @@ class FileOrganizerApp:
         self._create_options_section()
         self._create_action_buttons()
         self._create_progress_section()
+        self._create_chart_section()
         self._create_results_section()
         self._create_footer()
 
@@ -1104,6 +1120,178 @@ class FileOrganizerApp:
                                      **self._bootstyle("success"))
         self.progress_pct.pack(side="right")
 
+    def _create_chart_section(self):
+        """Create the pie chart section for file extension analysis."""
+        card = ttk.Labelframe(self.main_frame, text="  File Extension Analysis  ", padding=15)
+        card.pack(fill="x", pady=(0, 15))
+
+        # Container for chart and legend side by side
+        chart_container = ttk.Frame(card)
+        chart_container.pack(fill="x")
+
+        # Pie chart canvas
+        chart_frame = ttk.Frame(chart_container)
+        chart_frame.pack(side="left", padx=(0, 20))
+
+        self.chart_size = 180
+        self.chart_canvas = tk.Canvas(
+            chart_frame,
+            width=self.chart_size,
+            height=self.chart_size,
+            highlightthickness=0,
+            bg=self._get_canvas_bg()
+        )
+        self.chart_canvas.pack()
+
+        # Draw empty chart placeholder
+        self._draw_empty_chart()
+
+        # Legend frame
+        self.legend_frame = ttk.Frame(chart_container)
+        self.legend_frame.pack(side="left", fill="both", expand=True)
+
+        # Placeholder text
+        self.chart_placeholder = ttk.Label(
+            self.legend_frame,
+            text="Click 'Preview Changes' to analyze file extensions",
+            font=("Segoe UI", 10),
+            **self._bootstyle("secondary")
+        )
+        self.chart_placeholder.pack(anchor="w", pady=20)
+
+    def _get_canvas_bg(self) -> str:
+        """Get appropriate background color for canvas based on theme."""
+        if TTKBOOTSTRAP_AVAILABLE:
+            return "#2b3e50"  # superhero theme background
+        return "#f0f0f0"  # default light gray
+
+    def _draw_empty_chart(self):
+        """Draw an empty placeholder pie chart."""
+        self.chart_canvas.delete("all")
+        padding = 10
+        x0, y0 = padding, padding
+        x1, y1 = self.chart_size - padding, self.chart_size - padding
+
+        # Draw empty circle
+        self.chart_canvas.create_oval(
+            x0, y0, x1, y1,
+            fill="#3d5a73" if TTKBOOTSTRAP_AVAILABLE else "#e0e0e0",
+            outline="#4a6785" if TTKBOOTSTRAP_AVAILABLE else "#cccccc",
+            width=2
+        )
+
+        # Draw placeholder text
+        center = self.chart_size // 2
+        self.chart_canvas.create_text(
+            center, center,
+            text="No data",
+            fill="#8899a6" if TTKBOOTSTRAP_AVAILABLE else "#999999",
+            font=("Segoe UI", 10)
+        )
+
+    def _draw_pie_chart(self, extension_counts: dict[str, int]):
+        """Draw a pie chart showing file extension distribution."""
+        self.chart_canvas.delete("all")
+
+        # Clear legend
+        for widget in self.legend_frame.winfo_children():
+            widget.destroy()
+
+        if not extension_counts:
+            self._draw_empty_chart()
+            return
+
+        total = sum(extension_counts.values())
+        if total == 0:
+            self._draw_empty_chart()
+            return
+
+        # Sort by count and limit to top entries
+        sorted_exts = sorted(extension_counts.items(), key=lambda x: x[1], reverse=True)
+
+        # Group small slices into "Other"
+        max_slices = 8
+        if len(sorted_exts) > max_slices:
+            top_exts = sorted_exts[:max_slices - 1]
+            other_count = sum(count for _, count in sorted_exts[max_slices - 1:])
+            top_exts.append(("Other", other_count))
+            sorted_exts = top_exts
+
+        # Draw pie slices
+        padding = 10
+        x0, y0 = padding, padding
+        x1, y1 = self.chart_size - padding, self.chart_size - padding
+
+        start_angle = 90  # Start from top
+        legend_items = []
+
+        for i, (ext, count) in enumerate(sorted_exts):
+            # Calculate slice angle
+            slice_angle = (count / total) * 360
+            color = PIE_COLORS[i % len(PIE_COLORS)]
+
+            # Draw slice
+            if slice_angle > 0:
+                self.chart_canvas.create_arc(
+                    x0, y0, x1, y1,
+                    start=start_angle,
+                    extent=-slice_angle,  # Negative for clockwise
+                    fill=color,
+                    outline="#ffffff" if TTKBOOTSTRAP_AVAILABLE else "#333333",
+                    width=1
+                )
+
+            # Calculate percentage
+            percentage = (count / total) * 100
+            legend_items.append((ext, count, percentage, color))
+
+            start_angle -= slice_angle
+
+        # Draw legend
+        legend_title = ttk.Label(
+            self.legend_frame,
+            text=f"Extensions ({total} files)",
+            font=("Segoe UI", 10, "bold")
+        )
+        legend_title.pack(anchor="w", pady=(0, 8))
+
+        for ext, count, pct, color in legend_items:
+            item_frame = ttk.Frame(self.legend_frame)
+            item_frame.pack(fill="x", pady=1)
+
+            # Color box
+            color_canvas = tk.Canvas(
+                item_frame, width=12, height=12,
+                highlightthickness=0,
+                bg=self._get_canvas_bg()
+            )
+            color_canvas.pack(side="left", padx=(0, 6))
+            color_canvas.create_rectangle(0, 0, 12, 12, fill=color, outline="")
+
+            # Extension name and count
+            ext_display = ext if ext else "(no ext)"
+            label_text = f"{ext_display}: {count} ({pct:.1f}%)"
+            label = ttk.Label(
+                item_frame,
+                text=label_text,
+                font=("Segoe UI", 9),
+                **self._bootstyle("secondary")
+            )
+            label.pack(side="left")
+
+    def _clear_chart(self):
+        """Clear the pie chart and show placeholder."""
+        self._draw_empty_chart()
+        for widget in self.legend_frame.winfo_children():
+            widget.destroy()
+        self.chart_placeholder = ttk.Label(
+            self.legend_frame,
+            text="Click 'Preview Changes' to analyze file extensions",
+            font=("Segoe UI", 10),
+            **self._bootstyle("secondary")
+        )
+        self.chart_placeholder.pack(anchor="w", pady=20)
+
     def _create_results_section(self):
         card = ttk.Labelframe(self.main_frame, text="  Results  ", padding=15)
         card.pack(fill="both", expand=True, pady=(0, 15))
@@ -1206,6 +1394,7 @@ class FileOrganizerApp:
             widget.destroy()
         self.results_summary.configure(text="")
         self.status_indicator.pack_forget()
+        self._clear_chart()
 
     def _set_progress(self, percent: float):
         self.progress_bar["value"] = percent
@@ -1355,6 +1544,15 @@ class FileOrganizerApp:
                                      wraplength=700,
                                      **self._bootstyle("warning"))
             warning_label.pack(pady=8)
+
+        # Build extension counts for pie chart
+        extension_counts = {}
+        for move in self.planned_moves:
+            ext = move.source.suffix.lower() if move.source.suffix else "(no ext)"
+            extension_counts[ext] = extension_counts.get(ext, 0) + 1
+
+        # Update pie chart
+        self._draw_pie_chart(extension_counts)
 
         if not self.planned_moves and not self.planned_folder_moves and not self.skipped_files:
             self.status_var.set("No files need to be organized.")
