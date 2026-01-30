@@ -35,6 +35,11 @@ A modern Windows desktop application that automatically organizes files by type 
 - **Flatten all files** — Ignore folder structure and sort all files individually
 - Delete empty folders after organizing
 
+### File Analysis
+- **Pie chart visualization** — See file extension distribution before organizing
+- Color-coded chart with legend showing counts and percentages
+- Top 8 extensions displayed, smaller groups combined as "Other"
+
 ### Safety Features
 - **Preview mode** — See all changes before applying
 - **Automatic backup** — JSON log of all moves saved before organizing
@@ -68,6 +73,12 @@ A modern Windows desktop application that automatically organizes files by type 
 │  └────────────────────────────────────────────────────┘   │
 │                                                            │
 │  [Preview] [Organize Files] [Cancel]          [Restore...] │
+│                                                            │
+│  File Extension Analysis                                   │
+│  ┌────────────────────────────────────────────────────┐   │
+│  │  [PIE]    .jpg: 45 (28.8%)  .pdf: 32 (20.5%)      │   │
+│  │  [CHART]  .png: 28 (17.9%)  .docx: 18 (11.5%)     │   │
+│  └────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────┘
 ```
 
