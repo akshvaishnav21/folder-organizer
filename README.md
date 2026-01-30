@@ -70,7 +70,13 @@ A modern Windows desktop application that automatically organizes files by type 
 
 ## Installation
 
-No installation required. Just run with Python:
+1. Install the optional dependency for modern UI styling:
+
+```bash
+pip install ttkbootstrap
+```
+
+2. Run the application:
 
 ```bash
 python file_organizer.py
@@ -79,7 +85,9 @@ python file_organizer.py
 **Requirements:**
 - Python 3.10 or higher
 - Windows (uses native file creation dates and Windows API)
-- No external dependencies (uses only standard library)
+- [ttkbootstrap](https://ttkbootstrap.readthedocs.io/) (optional, for modern dark theme UI)
+
+> **Note:** The app works without ttkbootstrap but will use the default tkinter appearance.
 
 ## Usage
 
